@@ -5,34 +5,55 @@
 
 ## Goal
 
-Port the [werdhaihai/msi_lateral_mv](https://github.com/werdhaihai/msi_lateral_mv) BoF (C, ~1300 LoC across `bof/`) to a Rust `no_std` BoF built on the [joaoviictorti/rustbof](https://github.com/joaoviictorti/rustbof) template. The DLL payload (`sqldriverdll/`) is out of scope and remains C/C++.
+Port the [werdhaihai/msi_lateral_mv](https://github.com/werdhaihai/msi_lateral_mv) project to Rust — both the BoF (C, ~1300 LoC across `bof/`) → `no_std` Rust BoF built on the [joaoviictorti/rustbof](https://github.com/joaoviictorti/rustbof) template, **and** the sample driver DLL (`sqldriverdll/TestDriver/dllmain.cpp`) → Rust `cdylib`. Target loader is Cobalt Strike (Beacon Object File dynamic function resolution).
 
 The port preserves the underlying technique: use the MSI Server COM object over DCOM to install/configure an ODBC driver whose custom action executes an attacker-supplied DLL on a local or remote host, optionally under alternate or domain credentials.
 
+## String Refactor Requirement (Evasion)
+
+All operator-visible strings, log messages, banners, artifact names, symbol names within our control, and hardcoded paths **must not match** anything in `msi_lateral_mv`. Rationale: string-based YARA / EDR signatures over the public repo. Scope:
+
+- BoF crate name, output `.o` name → already `letmove_msi`.
+- BoF `BeaconPrintf`/`eprintln!`/`println!` message contents (banners like `[+] Attempting lateral movement to ...`, `[-] Calling SQLInstallDriverEx`, `[$] Driver installed successfully. Usage count: %d`, `[LFG] Driver configured successfully`, `SQLInstallDriverEx failed. HRESULT: ...`, etc.).
+- DLL project/crate name, log file path (`C:\Users\domainadmin\Desktop\MSI_Output.log`), log format headers, per-line labels (`Username:`, `User SID:`, `Token Elevated:`, `Logon Session ID:`, `Process ID:`, `Integrity Level:`), literal `"ConfigDriver Called"`.
+- Rust module names inside our crates (avoid `msilat`, `comstuff`).
+
+Do NOT refactor:
+- Win32 API names (`SQLInstallDriverEx`, `CoCreateInstanceEx`, `LoadLibraryW`, ...) — required by the OS.
+- GUIDs (`CLSID_MsiServer`, `IID_IMsiCustomAction`, ...) — required by DCOM.
+- Exported symbol `ConfigDriver` in the DLL — the ODBC installer looks it up by that name.
+- Argument-decoding string tokens `"local"`/`"remote"` — operator wire protocol.
+
 ## Non-Goals
 
-- No port of `sqldriverdll/`.
 - No new capability beyond the C original (no additional lateral-movement primitives, no persistence, no bundled loader).
 - No Cobalt Strike aggressor script rewrite; usage snippet documented in README only.
+- No indirect-syscall / string-encryption hardening beyond the plain rename refactor.
 
 ## Layout
 
-Standalone crate placed at `LetMoveMSI/msi_lateral_mv_rs/`:
+Two Rust crates under a top-level Cargo workspace at `LetMoveMSI/letmove_msi_ws/`:
 
 ```
-msi_lateral_mv_rs/
-├── Cargo.toml           # crate-type = ["staticlib"]
-├── Makefile.toml        # cargo-make → boflink → .o
-├── rust-toolchain.toml  # nightly
-├── README.md            # usage + build
-└── src/
-    ├── lib.rs           # #[rustbof::main] entry, arg dispatch
-    ├── args.rs          # DataParser wrapper → Args
-    ├── com.rs           # IUnknown/IDispatch/IMsiServer vtables + GUIDs
-    ├── auth.rs          # COAUTHIDENTITY/COAUTHINFO builder + CoSetProxyBlanket
-    ├── msi.rs           # port of msilat.c orchestration
-    └── utils.rs         # wide-string, GUID gen, HRESULT format
+letmove_msi_ws/
+├── Cargo.toml                  # [workspace] members = ["bof", "driver"]
+├── rust-toolchain.toml         # nightly
+└── bof/                        # the BoF (staticlib → COFF via boflink)
+│   ├── Cargo.toml              # crate-type = ["staticlib"], name = "letmove_msi"
+│   ├── Makefile.toml           # cargo-make → boflink → letmove_msi.o
+│   └── src/
+│       ├── lib.rs              # #[rustbof::main] entry, dispatch
+│       ├── argv.rs             # DataParser wrapper (was args.rs)
+│       ├── vtbl.rs             # IUnknown / IMsi* vtables + GUIDs (was com.rs)
+│       ├── secure.rs           # COAUTHIDENTITY/COAUTHINFO + proxy blanket (was auth.rs)
+│       ├── stage.rs            # MsiServer + CustomActionServer bring-up (was msi.rs)
+│       └── deploy.rs           # SQLInstallDriverEx + SQLConfigDriver (was install.rs)
+└── driver/                     # ODBC driver DLL loaded by the target
+    ├── Cargo.toml              # crate-type = ["cdylib"], name = "odbcpivot"
+    └── src/lib.rs              # DllMain + exported ConfigDriver
 ```
+
+Module names are deliberately different from upstream (`msilat`, `comstuff`, `TestDriver`) to avoid symbol overlap in stripped-symbol builds.
 
 Dependencies (`Cargo.toml`):
 - `rustbof` — git = "https://github.com/joaoviictorti/rustbof"
@@ -137,12 +158,25 @@ BoF context is not conducive to unit testing (`no_std`, resolved at load time, s
 - README documents: prerequisites (nightly, boflink, cargo-make), build command, argument syntax, DLL-placement caveat inherited from upstream.
 - License: MIT (matches upstream posture; single `LICENSE` file at crate root).
 
+## Driver DLL (`driver/`) design
+
+Port of `sqldriverdll/TestDriver/dllmain.cpp` to a Rust `cdylib` (`odbcpivot.dll`) with the same public shape but refactored strings:
+
+- Export `ConfigDriver` with the ODBC `INSTAPI` (`__stdcall` on x86; standard on x64) signature — name kept verbatim, symbol un-mangled via `#[unsafe(no_mangle)] pub extern "system" fn ConfigDriver(...)` and a `.def` file if needed.
+- `DllMain` no-op (returns TRUE).
+- On `ConfigDriver` invocation: collect current process context (username, user SID, elevation, logon session id, PID, integrity level) via `windows-sys` (`GetUserNameW`, `OpenProcessToken`, `GetTokenInformation`, `ConvertSidToStringSidW`, `GetSidSubAuthority[Count]`) and write to a log file.
+- Log file: parameterised at compile time via `env!("ODBCPIVOT_LOG")` with default `%PROGRAMDATA%\odbcpivot.dat` — moved off the user's Desktop and off the `MSI_Output.log` name. Absolute-path fallback lives inside `%PROGRAMDATA%` so a non-interactive session (SYSTEM) can write it.
+- Log line labels refactored (e.g. `sub=`, `sid=`, `elev=`, `sess=`, `pid=`, `il=`) — key=value form, not the original human-readable labels.
+- No `stdio.h` heritage: use `windows-sys` file I/O (`CreateFileW` + `WriteFile`), not `fopen_s`. This also drops the CRT dependency.
+
+Build: `cargo build --release -p driver` → `target/release/odbcpivot.dll`. Cross-compile from Linux/macOS via `x86_64-pc-windows-gnu` target; toolchain note in README.
+
 ## Out of Scope / Deferred
 
-- Payload DLL port to Rust.
-- OPSEC hardening (indirect syscalls, string obfuscation) beyond what rustbof gives.
+- OPSEC hardening (indirect syscalls, string encryption/obfuscation, IAT hiding) beyond the plain rename refactor.
 - Aggressor/CNA integration script.
 - Windows on ARM64 target.
+- x86 (32-bit) build.
 
 ## Open Questions
 

