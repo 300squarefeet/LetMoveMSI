@@ -1,0 +1,9 @@
+[package]
+name = "driver"
+version = "0.1.0"
+edition = "2024"
+authors = ["daniagungg"]
+publish = false
+
+[lib]
+crate-type = ["rlib"]

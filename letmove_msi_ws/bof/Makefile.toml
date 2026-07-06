@@ -1,0 +1,38 @@
+[env]
+LIBS = "-lkernel32 -ladvapi32 -lsecur32"
+NAME = "letmove_msi"
+OUT_DIR = "out"
+
+[tasks.create-out]
+description = "Create output directory"
+script_runner = "@duckscript"
+script = "mkdir ${OUT_DIR}"
+
+[tasks.build-x64]
+description = "Build x64"
+command = "cargo"
+args = ["build", "--release", "--target", "x86_64-pc-windows-gnu"]
+
+[tasks.link-x64]
+description = "Link x64"
+script_runner = "@shell"
+script = "boflink --mingw64 ${LIBS} --gc-sections --entry=go ../target/x86_64-pc-windows-gnu/release/lib${NAME}.a -o ${OUT_DIR}/${NAME}.x64.o"
+dependencies = ["build-x64", "create-out"]
+
+[tasks.build-x86]
+description = "Build x86"
+command = "cargo"
+args = ["build", "--release", "--target", "i686-pc-windows-gnu"]
+
+[tasks.link-x86]
+description = "Link x86"
+script_runner = "@shell"
+script = "boflink --mingw32 ${LIBS} --gc-sections --entry=_go ../target/i686-pc-windows-gnu/release/lib${NAME}.a -o ${OUT_DIR}/${NAME}.x86.o"
+dependencies = ["build-x86", "create-out"]
+
+[tasks.build-all]
+description = "Build and link both x86 and x64"
+dependencies = ["link-x64", "link-x86"]
+
+[tasks.default]
+alias = "build-all"

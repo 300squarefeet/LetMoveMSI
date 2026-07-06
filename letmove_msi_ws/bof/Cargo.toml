@@ -1,0 +1,32 @@
+[package]
+name = "letmove_msi"
+version = "0.1.0"
+edition = "2024"
+authors = ["daniagungg"]
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies.rustbof]
+git = "https://github.com/joaoviictorti/rustbof"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Rpc",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Environment",
+    "Win32_Security_Authentication_Identity",
+    "Win32_UI_Shell",
+]
+
+[profile.release]
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
+strip = true
+lto = true
