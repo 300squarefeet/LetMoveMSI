@@ -1,6 +1,7 @@
 #![no_std]
 
 mod argv;
+mod secure;
 mod vtbl;
 
 use rustbof::println;
