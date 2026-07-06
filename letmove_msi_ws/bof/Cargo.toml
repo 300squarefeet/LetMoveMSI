@@ -23,10 +23,3 @@ features = [
     "Win32_Security_Authentication_Identity",
     "Win32_UI_Shell",
 ]
-
-[profile.release]
-opt-level = "z"
-codegen-units = 1
-panic = "abort"
-strip = true
-lto = true

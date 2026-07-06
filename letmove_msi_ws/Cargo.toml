@@ -1,3 +1,10 @@
 [workspace]
 resolver = "2"
 members  = ["bof", "driver"]
+
+[profile.release]
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
+strip = true
+lto = true
