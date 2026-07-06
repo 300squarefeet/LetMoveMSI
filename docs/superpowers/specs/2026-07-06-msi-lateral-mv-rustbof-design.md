@@ -45,7 +45,7 @@ Release profile mirrors rustbof examples: `opt-level = "z"`, `codegen-units = 1`
 Simplified from the C original's six positional variants to a single subcommand form:
 
 ```
-msi_lateral_mv <local|remote> [host] [--domain D] [--user U --pass P] <driver> <dll>
+letmove_msi <local|remote> [host] [--domain D] [--user U --pass P] <driver> <dll>
 ```
 
 Parsed as wide strings via `DataParser::get_wstr()`. Mapping to internal enums:
@@ -118,13 +118,13 @@ No `?` operator (would require custom `Error` + `From` impls). Manual `Release()
 
 BoF context is not conducive to unit testing (`no_std`, resolved at load time, side-effectful COM calls). Verification is manual:
 
-- Build: `cargo make` produces `msi_lateral_mv.o`.
-- Sanity: `llvm-objdump -h msi_lateral_mv.o` shows expected COFF sections and no unresolved externs beyond Beacon-resolvable imports.
+- Build: `cargo make` produces `letmove_msi.o`.
+- Sanity: `llvm-objdump -h letmove_msi.o` shows expected COFF sections and no unresolved externs beyond Beacon-resolvable imports.
 - Functional: load in a Cobalt Strike / Havoc lab against a Windows target with MSI service running; verify DLL executes on target (both local alt-user and remote paths).
 
 ## Build & Release
 
-- `cargo make` (default task) → `boflink` link → `target/.../msi_lateral_mv.o`.
+- `cargo make` (default task) → `boflink` link → `target/.../letmove_msi.o`.
 - README documents: prerequisites (nightly, boflink, cargo-make), build command, argument syntax, DLL-placement caveat inherited from upstream.
 - License: MIT (matches upstream posture; single `LICENSE` file at crate root).
 
