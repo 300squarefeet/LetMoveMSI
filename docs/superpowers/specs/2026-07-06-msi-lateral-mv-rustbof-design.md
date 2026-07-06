@@ -68,26 +68,35 @@ Rules:
 `lib.rs::main`:
 
 1. Parse `Args` (or bail with usage).
-2. `CoInitializeEx(NULL, COINIT_APARTMENTTHREADED)`.
-3. `auth::build(&creds)` → `Option<(COAUTHIDENTITY, COAUTHINFO, COSERVERINFO)>` (None for `Current`).
-4. `CoCreateInstanceEx(CLSID_MsiServer, NULL, CLSCTX_LOCAL_SERVER|CLSCTX_REMOTE_SERVER, server_info, 1 MULTI_QI[IID_IDispatch])` → `*mut IDispatch`.
-5. If alt/domain: `CoSetProxyBlanket(disp, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL, RPC_C_AUTHN_LEVEL_PKT_PRIVACY, RPC_C_IMP_LEVEL_IMPERSONATE, &auth_id, EOAC_DEFAULT)`.
-6. `msi::install(disp, &driver, &dll)` — orchestrates the MSI Server call sequence.
-7. `disp->Release()`; `CoUninitialize()`.
-
-`msi.rs::install` mirrors `bof/msilat.c` step-for-step, invoking `IDispatch::Invoke` for each MSI Server method (OpenDatabase → CreateRecord → StringData set → InstallProduct) with property string `ACTION=INSTALL ODBCDRIVER=<name> DLLPATH=<path>` (exact tokenisation lifted from the C source during implementation). DISPIDs resolved via `GetIDsOfNames` on first use and cached in locals.
+2. `CoInitialize(NULL)`.
+3. `auth::build(&creds)` → `COAUTHINFO` (`pAuthIdentityData = NULL` for `Current`).
+4. `CoInitializeSecurity(..., PKT_INTEGRITY, IMPERSONATE, &sole_auth_list, EOAC_NONE, ...)`.
+5. `CoCreateInstanceEx(CLSID_MsiServer, NULL, CLSCTX_LOCAL_SERVER|CLSCTX_REMOTE_SERVER, server_info?, 1, &MULTI_QI[IID_IMsiServer])` → `*mut IMsiServer` (an `IUnknown`).
+6. If remote: `SetupAuthOnParentIUnknownCastToIID(pMsiServer, &auth, IID_IMsiServer)` — i.e. `pMsiServer->QueryInterface` then `CoSetProxyBlanket` on the returned pointer — → `pMsiServerAuthd`.
+7. `msi::get_custom_action_server(pMsiServerAuthd, &auth)` → `pMsiCustomAction`:
+   - `LoadLibraryW("msi.dll")` → `GetProcAddress("DllGetClassObject")` → `IClassFactory` for `CLSID_MSIRemoteApi` → `CreateInstance(IID_IMsiRemoteAPI)` → fake `pRemApi`.
+   - Cast `pMsiServerAuthd` to `IMsiConfigurationManager` and call `CreateCustomActionServer(icac64Impersonated, fakePid=4, pRemApi, envBlock, envSize, 0, cookie, &cookieSize, &pMsiAction, &outServerPid, FALSE)`.
+   - `SetupAuthOnParentIUnknownCastToIID(pMsiAction, &auth, IID_IMsiCustomAction)` → `pAuthedAction`.
+8. `msi::install_driver(pAuthedAction, driver, dll)`:
+   - Split `dll` path into directory + filename via `PathFindFileNameW` + `PathRemoveFileSpecW`.
+   - Build ODBC driver-info block: three NUL-terminated wide sections `<drivername>\0Driver=<file>\0Setup=<file>\0\0`.
+   - `pAuthedAction->SQLInstallDriverEx(len, driver_info, path_in, path_out, 256, &path_out_len, 2 /* ODBC_INSTALL_COMPLETE */, &usage_count, &raw_rc)`.
+   - `pAuthedAction->SQLConfigDriver(1 /* ODBC_INSTALL_DRIVER */, drivername, NULL, msg_buf, 256, &msg_len, &config_rc)`.
+   - On failure: `pAuthedAction->SQLInstallerError(1, &err_code, err_msg, 256, &err_msg_len)` and print.
+9. Release chain: `pAuthedAction`, `pMsiServerAuthd`, free auth buffers, `CoUninitialize`.
 
 ## COM Bindings
 
-Raw `#[repr(C)]` vtables in `com.rs`:
+Raw `#[repr(C)]` vtables in `com.rs`, mirroring `bof/msilat.h`:
 
 ```rust
 #[repr(C)] pub struct IUnknownVtbl { QueryInterface, AddRef, Release }
-#[repr(C)] pub struct IDispatchVtbl { unk: IUnknownVtbl, GetTypeInfoCount, GetTypeInfo, GetIDsOfNames, Invoke }
-#[repr(C)] pub struct IMsiServerVtbl { disp: IDispatchVtbl /* only Invoke used */ }
+#[repr(C)] pub struct IMsiConfigurationManagerVtbl { unk: IUnknownVtbl, /* pad slots + */ CreateCustomActionServer }
+#[repr(C)] pub struct IMsiCustomActionVtbl { unk: IUnknownVtbl, /* pad slots + */ SQLInstallDriverEx, SQLConfigDriver, SQLInstallerError }
+#[repr(C)] pub struct IClassFactoryVtbl { unk: IUnknownVtbl, CreateInstance, LockServer }
 ```
 
-GUIDs as `const GUID` (CLSID_MsiServer `000C101C-0000-0000-C000-000000000046`, IID_IDispatch `00020400-0000-0000-C000-000000000046`). No `windows` crate — kept lean for `no_std` and small COFF footprint.
+GUIDs as `const GUID` copied verbatim from the C source: `CLSID_MsiServer`, `IID_IMsiServer`, `CLSID_MSIRemoteApi`, `IID_IMsiRemoteAPI`, `IID_IMsiCustomAction`, `IID_IClassFactory`. No `windows` crate — kept lean for `no_std` and small COFF footprint. `windows-sys` supplies the flat APIs (`CoCreateInstanceEx`, `CoSetProxyBlanket`, `CoInitializeSecurity`, `LoadLibraryW`, `GetProcAddress`, `GetEnvironmentStringsW`, `PathFindFileNameW`, `PathRemoveFileSpecW`).
 
 ## Auth Building
 
