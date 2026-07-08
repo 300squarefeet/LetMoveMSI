@@ -1,6 +1,7 @@
 #![no_std]
 
 mod argv;
+mod deploy;
 mod secure;
 mod stage;
 mod vtbl;
@@ -26,6 +27,11 @@ fn main(args: *mut u8, len: usize) {
             }
         };
         println!("stage2 ok @{:p}", act);
+        if let Err(hr) = deploy::run(act, a.driver, a.dll) {
+            eprintln!("stage3 rc=0x{:08X}", hr as u32);
+        } else {
+            println!("done");
+        }
         ((*(*act).lpVtbl).base.Release)(act as *mut vtbl::IUnknown);
         ((*(*srv).lpVtbl).Release)(srv);
         CoUninitialize();
