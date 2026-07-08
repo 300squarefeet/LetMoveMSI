@@ -1,5 +1,5 @@
 [env]
-LIBS = "-lkernel32 -ladvapi32 -lsecur32"
+LIBS = "-lkernel32 -ladvapi32 -lsecur32 -lole32"
 NAME = "letmove_msi"
 OUT_DIR = "out"
 
