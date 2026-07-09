@@ -1,3 +1,5 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use core::ptr::null;
 use windows_sys::core::HRESULT;
 use windows_sys::Win32::UI::Shell::{PathFindFileNameW, PathRemoveFileSpecW};

@@ -12,7 +12,8 @@ use windows_sys::Win32::System::Com::CoUninitialize;
 #[rustbof::main]
 fn main(args: *mut u8, len: usize) {
     let Some(a) = argv::parse(args, len) else { return };
-    let bundle = secure::build(a.domain, a.user, a.pass);
+    let mut bundle = secure::build(a.domain, a.user, a.pass);
+    secure::bind_identity(&mut bundle);
     unsafe {
         let srv = match stage::open_server(&bundle, a.host) {
             Ok(p) => p,

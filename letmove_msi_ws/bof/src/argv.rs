@@ -5,7 +5,6 @@ use rustbof::eprintln;
 pub enum Mode { Local, Remote }
 
 pub struct Args {
-    pub mode:   Mode,
     pub host:   Option<*const u16>,
     pub domain: Option<*const u16>,
     pub user:   Option<*const u16>,
@@ -70,7 +69,6 @@ pub fn parse(args: *mut u8, len: usize) -> Option<Args> {
     if opt(domain).is_some() && !has_u { eprintln!("realm requires principal"); return None; }
 
     Some(Args {
-        mode,
         host: opt(host), domain: opt(domain), user: opt(user), pass: opt(pass),
         driver, dll,
     })

@@ -1,3 +1,5 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use core::ptr::{null, null_mut};
 use windows_sys::core::{GUID, HRESULT};
 use windows_sys::Win32::System::Com::{
@@ -53,11 +55,19 @@ pub fn build(
     b.auth_info.pwszServerPrincName  = null_mut();
     b.auth_info.dwAuthnLevel         = RPC_C_AUTHN_LEVEL_PKT_INTEGRITY as u32;
     b.auth_info.dwImpersonationLevel = RPC_C_IMP_LEVEL_IMPERSONATE as u32;
-    b.auth_info.pAuthIdentityData    = if b.has_ident {
-        &b.auth_id as *const _ as *mut _
-    } else { null_mut() };
+    b.auth_info.pAuthIdentityData    = null_mut();
     b.auth_info.dwCapabilities       = EOAC_NONE as u32;
     b
+}
+
+// Binds `auth_info.pAuthIdentityData` to point at `auth_id` after the bundle
+// has settled at its final address. Must be called on the caller's copy of
+// `AuthBundle` (not the returned-by-value temporary) so the self-reference is
+// valid for the bundle's remaining lifetime.
+pub fn bind_identity(b: &mut AuthBundle) {
+    if b.has_ident {
+        b.auth_info.pAuthIdentityData = &b.auth_id as *const _ as *mut _;
+    }
 }
 
 pub unsafe fn init_com_security(b: &AuthBundle) -> HRESULT {
