@@ -1,6 +1,6 @@
 # LetMoveMSI
 
-String literals, log paths, and internal module names were rewritten so nothing byte-matches the upstream C source. Static signatures over the public repo would otherwise flag this port immediately.
+Lateral Movement
 
 ## Requirements
 
