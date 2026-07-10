@@ -1,12 +1,5 @@
 # LetMoveMSI
 
-Rust port of [werdhaihai/msi_lateral_mv](https://github.com/werdhaihai/msi_lateral_mv). Two crates in one workspace:
-
-- `bof/`: no_std Beacon Object File for Cobalt Strike. Authenticates to the MSI Server over DCOM, spawns a Custom Action Server, and calls `SQLInstallDriverEx` + `SQLConfigDriver` to install an ODBC driver whose Setup DLL executes on the target.
-- `driver/`: Rust cdylib (`odbcpivot.dll`) exporting `ConfigDriver`. A minimal payload that logs the caller's token context to a file.
-
-The technique is described in the SpecterOps write-up [DCOM Again: Installing Trouble Lateral Movement BOF](https://specterops.io/blog/2025/09/29/dcom-again-installing-trouble-lateral-movement-bof/) by Werd Haihai. The Custom Action Server bounce is Eliran Nasser's (Deep Instinct).
-
 String literals, log paths, and internal module names were rewritten so nothing byte-matches the upstream C source. Static signatures over the public repo would otherwise flag this port immediately.
 
 ## Requirements
@@ -84,7 +77,6 @@ rust-toolchain.toml
 
 ## Credits
 
-- Original C BoF and technique: [werdhaihai/msi_lateral_mv](https://github.com/werdhaihai/msi_lateral_mv)
 - SpecterOps write-up: [DCOM Again](https://specterops.io/blog/2025/09/29/dcom-again-installing-trouble-lateral-movement-bof/)
 - Custom Action Server bounce: Eliran Nasser (Deep Instinct), [Forget PsExec: DCOM Upload & Execute Backdoor](https://www.deepinstinct.com/blog/forget-psexec-dcom-upload-execute-backdoor)
 - BoF template: [joaoviictorti/rustbof](https://github.com/joaoviictorti/rustbof)
